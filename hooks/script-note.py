@@ -4,7 +4,7 @@
 PreToolUse hook on Bash. It adds a note, never a deny, in two cases:
   - the command matches a family in lib/script_families.json that has a covering script:
     "`<script>` does this: <usage>". Once per family per session.
-  - the command calls a lean-agent script by its .../plugins/cache/lean-agent/lean-agent/
+  - the command calls a lean-agent script by its .../plugins/cache/lean-agent-tools/lean-agent-tools/
     <version>/tools/ path (or the older bin/ one): the versioned path breaks after an upgrade, use
     the absolute tools path. Once per session.
 It also blocks (exit 2) a command that runs dotnet test, npx vitest, vitest run or npm test
@@ -58,7 +58,7 @@ HOOK = {
 
 REPEATS = os.path.join(HERE, "..", "tools", "script-repeats")
 PATH_FAMILY = "versioned-plugin-path"
-BIN_PATH = re.compile(r"lean-agent/lean-agent/\d+\.\d+\.\d+/(?:bin|tools)/([A-Za-z0-9][\w.-]*)")
+BIN_PATH = re.compile(r"lean-agent-tools/lean-agent-tools/\d+\.\d+\.\d+/(?:bin|tools)/([A-Za-z0-9][\w.-]*)")
 SID = re.compile(r"[A-Za-z0-9-]{1,100}")
 MAX_AGE = 14 * 86400
 SKIP_FAMILIES = {"direct-test-run"}
@@ -322,7 +322,7 @@ def self_test():
     check("unrelated command", fire("ls -la && echo hi", "plain")[1] == "")
     check("wait-loop family gets no note here", fire("pgrep -f dotnet", "pg")[1] == "")
     check("a command naming the script gets no note", fire("holdout.sh --spec x.md  # mutation", "named")[1] == "")
-    rc, text, _ = fire("~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/tools/style-scan --help", "vp")
+    rc, text, _ = fire("~/.claude/plugins/cache/lean-agent-tools/lean-agent-tools/1.14.1/tools/style-scan --help", "vp")
     check("versioned path note", "`style-scan`" in text and hookkit.tool_path("style-scan") in text and "CLAUDE_PLUGIN_ROOT" not in text, repr(text))
     saved_env = {k: os.environ.get(k) for k in ("CLAUDE_ENV_FILE", "PATH", "HOME")}
     with tempfile.TemporaryDirectory() as fake_home:
@@ -330,7 +330,7 @@ def self_test():
             os.environ.pop("CLAUDE_ENV_FILE", None)  # a PreToolUse hook never gets it
             os.environ["PATH"] = "/usr/bin"
             os.environ["HOME"] = fake_home
-            cmd = "~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/tools/style-scan --help"
+            cmd = "~/.claude/plugins/cache/lean-agent-tools/lean-agent-tools/1.14.1/tools/style-scan --help"
             rc, text, _ = fire(cmd, "vp-off")
             check("versioned path note keeps the full path with no marker", "as " + hookkit.tool_path("style-scan") in text
                   and "/tools/style-scan" in text, repr(text))
@@ -347,9 +347,9 @@ def self_test():
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
-    check("versioned path once", fire("~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/tools/replace x", "vp")[1] == "")
+    check("versioned path once", fire("~/.claude/plugins/cache/lean-agent-tools/lean-agent-tools/1.14.1/tools/replace x", "vp")[1] == "")
     check("hooks path is not noted",
-          fire("python3 ~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/hooks/wait-loop.py --self-test", "vh")[1] == "")
+          fire("python3 ~/.claude/plugins/cache/lean-agent-tools/lean-agent-tools/1.14.1/hooks/wait-loop.py --self-test", "vh")[1] == "")
     rc, text, _ = fire("pytest -q; npm view left-pad version; curl -s https://example.com/h", "two")
     check("two families, one note each, test runs left to wait-loop", text.count("does this:") == 2 and "test-phase" not in text, repr(text))
 

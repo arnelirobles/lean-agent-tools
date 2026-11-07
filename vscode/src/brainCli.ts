@@ -37,7 +37,7 @@ export function findBrain(setting: string, env: NodeJS.ProcessEnv = process.env,
     const p = path.join(dir, "brain");
     if (isExecutable(p)) return p;
   }
-  const root = path.join(home, ".claude", "plugins", "cache", "lean-agent", "lean-agent");
+  const root = path.join(home, ".claude", "plugins", "cache", "lean-agent-tools", "lean-agent-tools");
   let versions: string[] = [];
   try {
     versions = fs.readdirSync(root);

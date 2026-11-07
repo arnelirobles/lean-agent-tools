@@ -1,14 +1,14 @@
 {
-  "name": "lean-agent",
-  "version": "1.27.1",
-  "description": "Run coding agents over a backlog without burning a plan: agent-ready tickets, scripted gates, an adversarial critic, and a retro that improves the method from numbers.",
+  "name": "lean-agent-tools",
+  "version": "1.0.0",
+  "description": "Adds hooks, the brain MCP server, scripted gates and test tools to the lean-agent skills. Install it alongside the lean-agent plugin.",
   "author": {
     "name": "Arnel Robles",
     "url": "https://github.com/arnelirobles"
   },
-  "homepage": "https://github.com/arnelirobles/lean-agent",
-  "repository": "https://github.com/arnelirobles/lean-agent",
-  "license": "MIT",
+  "homepage": "https://github.com/arnelirobles/lean-agent-tools",
+  "repository": "https://github.com/arnelirobles/lean-agent-tools",
+  "license": "MPL-2.0",
   "mcpServers": {
     "brain": {
       "command": "${CLAUDE_PLUGIN_ROOT}/tools/brain-mcp"

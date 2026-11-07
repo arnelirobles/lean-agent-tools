@@ -33,7 +33,7 @@ describe("brain cli", () => {
 
   it("finds brain: setting, then PATH, then the newest plugin", () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "lb-"));
-    const root = path.join(home, ".claude", "plugins", "cache", "lean-agent", "lean-agent");
+    const root = path.join(home, ".claude", "plugins", "cache", "lean-agent-tools", "lean-agent-tools");
     exe(path.join(root, "1.9.0", "tools", "brain"));
     exe(path.join(root, "1.10.0", "tools", "brain"));
     exe(path.join(root, "1.2.0", "tools", "brain"));
@@ -50,7 +50,7 @@ describe("brain cli", () => {
 
   it("finds brain in bin/ for a plugin version before tools/", () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "lb-"));
-    const root = path.join(home, ".claude", "plugins", "cache", "lean-agent", "lean-agent");
+    const root = path.join(home, ".claude", "plugins", "cache", "lean-agent-tools", "lean-agent-tools");
     exe(path.join(root, "1.15.0", "bin", "brain"));
     expect(findBrain("", { PATH: "" }, home)).toBe(path.join(root, "1.15.0", "bin", "brain"));
   });

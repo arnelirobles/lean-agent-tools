@@ -114,7 +114,7 @@ def self_test():
     check("background denied", bg("cd /x && bash scripts/preflight.sh > log 2>&1"), True)
     check("bounded passes", bg(f"{BOUNDED} -- bash -c 'make'"), False)
     check("python3 bounded passes", bg(f"python3 {BOUNDED} --minutes 90 -- make"), False)
-    check("test-phase passes", bg("~/.claude/plugins/cache/lean-agent/lean-agent/1.19.0/tools/test-phase --project x"), False)
+    check("test-phase passes", bg("~/.claude/plugins/cache/lean-agent-tools/lean-agent-tools/1.19.0/tools/test-phase --project x"), False)
     check("heavy.sh passes", bg("bash tools/heavy.sh dotnet dotnet test"), False)
     check("env prefix then bounded", bg(f"LEAN_BG_MINUTES=120 {BOUNDED} -- make"), False)
     check("bounded later in a chain is not enough", bg(f"make; {BOUNDED} -- true"), True)

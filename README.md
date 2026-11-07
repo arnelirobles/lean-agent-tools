@@ -3,91 +3,60 @@
   <img src="assets/logo-light.svg" width="72" height="72" alt="Lean agent">
 </picture>
 
-# Lean agent
+# lean-agent-tools
 
-Run AI coding agents over a ticket backlog without burning a plan in a night.
+Hooks, a brain MCP server, scripted gates and test tools for the lean-agent skills.
 
-[![version](https://img.shields.io/github/v/tag/arnelirobles/lean-agent?label=version&color=ec3013)](https://github.com/arnelirobles/lean-agent/releases) [![CI](https://github.com/arnelirobles/lean-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/arnelirobles/lean-agent/actions/workflows/ci.yml) [![licence](https://img.shields.io/badge/licence-MIT-201e1d)](LICENSE)
+[![licence](https://img.shields.io/badge/licence-MPL--2.0-201e1d)](LICENSE)
 
-Lean agent is a method and a Claude Code plugin. The method is how I ran agents over my own backlog after burning through a plan in one night in September 2026. The plugin is the part of the method that runs by itself: skills, scripts on the agent's PATH, and hooks that note, and in the strict profile block.
+lean-agent-tools is a Claude Code plugin that adds the parts of lean agent that run by themselves: hooks that note (and in the strict profile block), the `brain` database and MCP server, scripts on the agent's PATH, and the test queue. It needs the [lean-agent](https://github.com/arnelirobles/lean-agent) skills plugin, which holds the method, the adversarial review, the ticket shape and the retro as plain Markdown. The `tools` skill in this plugin maps each plain step in those skills to the tool here that does it.
 
-**This release changes the default.** The hooks used to block. They now run in the `standard` profile, which gives a note or says nothing instead of refusing. Three things still block: a real key in a file Claude writes (when the scanner runs), the opt-in `LEAN_LOOKUP_MODE=block` and `LEAN_IMAGE_MODE=block`, and the git hooks you install. Set `LEAN_PROFILE=strict` to get the old blocks back. See [Profiles](#profiles).
+The default is the `standard` profile: hooks give a note or say nothing instead of refusing. Three things still block: a real key in a file Claude writes (when the scanner runs), the opt-in `LEAN_LOOKUP_MODE=block` and `LEAN_IMAGE_MODE=block`, and the git hooks you install. Set `LEAN_PROFILE=strict` for the full set of blocks. See [Profiles](#profiles).
 
 The numbers here are mine, at list prices, on one .NET codebase. Treat them as a shape, not a benchmark.
 
 ## Quickstart
 
+Install both plugins:
+
+```bash
+/plugin marketplace add arnelirobles/lean-agent
+/plugin install lean-agent@lean-agent
+
+/plugin marketplace add arnelirobles/lean-agent-tools
+/plugin install lean-agent-tools@lean-agent-tools
+```
+
+The same from a shell:
+
 ```bash
 claude plugin marketplace add arnelirobles/lean-agent
 claude plugin install lean-agent@lean-agent
+claude plugin marketplace add arnelirobles/lean-agent-tools
+claude plugin install lean-agent-tools@lean-agent-tools
 ```
 
-Nothing else is needed. By default (the `standard` profile) the hooks do not refuse your commands for style or workflow: a bad commit message, a direct `npm test` or a sleep loop gets a short note or nothing. Still blocking: a real key or token in a file Claude writes, the opt-in `LEAN_LOOKUP_MODE=block` and `LEAN_IMAGE_MODE=block`, and the git hooks you install. `LEAN_PROFILE=off` turns every hook off.
+Nothing else is needed. In the `standard` profile the hooks do not refuse your commands for style or workflow: a bad commit message, a direct `npm test` or a sleep loop gets a short note or nothing. `LEAN_PROFILE=off` turns every hook off.
 
-On a GitHub repository with no brain database and no test queue you can use two skills:
-
-- `/lean-agent:shape-ticket` searches the repository's open issues and pull requests with `gh`, then writes the issue in the agent-ready shape. It needs `gh` logged in and nothing from brain.
-- `/lean-agent:adversarial-review` reviews a pull request or branch with a hunting agent and a refuting agent, and reads the repository's own rules first. It uses git and `gh`, runs `tools/style-scan` on a review body, and logs a row to `~/.lean/lean.db`. It does not use brain or the test queue.
-
-## The short version
-
-Shape the ticket for the agent before anyone starts: one ticket is one agent pass, written so the agent needs nothing else, with the review's questions answered in advance. A cheaper model drafts every change, and a fast one finds code and runs the gates. Scripts, not instructions, run the mechanical checks. A cheap critic reviews every change against six fixed questions. The expensive model only sees what the critic cannot close. At most four changes in flight.
-
-That took me from about 13 dollars of model use per change to about 9, with no drop in what got caught. Until 1.4.0 this line said 66 and 25: the cost script counted each message's usage once per transcript row, and its prices were those of older models. [Section 7](https://github.com/arnelirobles/lean-agent/wiki/Measure-Every-Batch) has the correction.
-
-```mermaid
-flowchart TD
-    A[Ideas and findings] --> B["Shape the ticket (0)<br/>one agent pass, agent-ready, risks answered"]
-    B --> C["Cheap model drafts (2, 14)"]
-    C --> D["Scripts run the mechanical checks (4)<br/>preflight, holdout, needs-review"]
-    D --> E{"Diff fires a rule? (3)"}
-    E -- no --> H["Merge queue, four in flight at most (6)"]
-    E -- yes --> F["Cheap critic, six questions (2, 12)"]
-    F -- closed --> H
-    F -- a no not fixed in one round --> G["Back to the same drafter (5)<br/>expensive model only if it still fails"]
-    G --> D
-    H --> I["Measure the batch (7, 15)"]
-    I --> J["Something repeated or slipped through?<br/>Script it (4a)"]
-    J --> D
-```
-
-The numbers in brackets are sections of the method. Each one is a page in the [wiki](https://github.com/arnelirobles/lean-agent/wiki/Home).
-
-## Why three models
-
-Each step goes to the cheapest model that can do it without losing a defect.
-
-| Model | Runs | List price per million tokens, in and out |
-| --- | --- | --- |
-| Haiku (fast) | finding code, running the gates and pasting their output, collecting the retro's numbers | 0.10 and 0.50 |
-| Sonnet (cheap) | spec review, every draft, the critic's hunt and refute, the first fix round | 2 and 10 |
-| Opus (strong) | a finding not fixed in one round, an unsure answer on core code | 4 and 20 |
-
-Haiku is 20 times cheaper than Sonnet and faster, so work that only reads and reports costs almost nothing. It never answers a yes or no about code. A small model that wrongly throws out a finding drops a real defect with no trace, so the critic stays on Sonnet.
-
-What this saves depends on how much of a change's cost was searching and running scripts. Most of it is the draft and the critic, which do not move. The Haiku split has not been measured on a batch yet. Run `lean-stats report` after one: it prints cost by role, and `search`, `gate` and `retro` are the Haiku roles. If they stay under a few percent of the spend, the saving is small and `LEAN_MODEL_FAST=sonnet` changes nothing that matters.
+Without a brain database or a test queue, the skills in lean-agent still work on their own: `/lean-agent:shape-ticket` and `/lean-agent:adversarial-review` need only git and `gh`.
 
 `lean-stats` collects on its own: when a session ends, the SessionEnd hook starts `lean-stats collect --transcript` for that session and its subagents in the background. It never blocks the hook, and `LEAN_STATS=off` stops it. Each run stores counts only (no prompt, code or command text): peak context, turns over 80k, read-only lookup calls, image results, errored tool results and wait-loop calls. `lean-stats report` turns them into an Avoidable section. Each signal shows its share of the period's tokens and list price, and Haiku's share of runs is shown against the share of runs the method gives it. A turn counts toward a signal in whole, so the shares overlap and are an upper bound. Lookup calls are the coordinator's on Opus only. The next `lean-stats collect` reads a file again when any of its runs has no signals, so runs from an older lean-stats fill in; until then they are left out, not counted as zero. The fast model row is named after `LEAN_MODEL_FAST`.
 
 While a session runs, a hook tells the coordinator when it is costing the most. Once context passes `LEAN_CONTEXT_WARN` it adds a note on every turn: the size, what the turn costs at list price, the running total since it passed the threshold (a lower bound, since turns without a tool call are not counted), and to `/compact` or file what is open in brain and start a fresh session. After `LEAN_LOOKUP_WARN` read-only lookups by an Opus coordinator in one session it adds one note to send them to `lean:search` on the fast model. Above `LEAN_IMAGE_CONTEXT` tokens it adds one note per turn after an image result (a Read of a png, jpg, jpeg, gif or webp file or of a pdf with `pages`, or a tool with `screenshot` or `thumbnail` in its name). Subagents never get a note or a refusal. Notes block nothing. Two settings turn them into refusals (exit 2 from a PreToolUse hook): `LEAN_LOOKUP_MODE=block` refuses the next Grep, Glob or Bash grep, rg, find or cat once an Opus coordinator has made more than `LEAN_LOOKUP_WARN` lookups since it last started an Agent. Read, ls and git or gh state checks count but are never refused, since an Edit needs a Read first and a state check is not a search. Starting an Agent resets that count; the note mode's count is per session and its note fires once, and `LEAN_IMAGE_MODE=block` refuses the image tools above `LEAN_IMAGE_CONTEXT`. Only searches already counted as read-only lookups can be refused, never a Read, a state check or a write. The counters live in `~/.lean/context-cost` (next to the database, private to you) and stay when a session is resumed, so a resumed session keeps its lookup count and does not repeat what it was told.
 
+## The method
+
+The method (tiers, the cascade of models, the critic, the retro) lives in the lean-agent skills plugin: [github.com/arnelirobles/lean-agent](https://github.com/arnelirobles/lean-agent), with the full write-up in its [wiki](https://github.com/arnelirobles/lean-agent/wiki/Home). This plugin supplies the tools those skills point to. Which model plays which role is set under [Settings](#settings).
+
 ## Install
 
-```bash
-claude plugin marketplace add arnelirobles/lean-agent
-claude plugin install lean-agent@lean-agent
-```
-
-Update with `claude plugin update lean-agent@lean-agent`. Claude Code picks up a change only when the plugin version moves. More in [Installation](https://github.com/arnelirobles/lean-agent/wiki/Installation).
+lean-agent-tools is installed next to lean-agent, not instead of it. See [Quickstart](#quickstart) for both. Update with `claude plugin update lean-agent-tools@lean-agent-tools`. Claude Code picks up a change only when the plugin version moves.
 
 ## What you get
 
 | Part | What it does | Reference |
 | --- | --- | --- |
-| `method` skill | The condensed rules. The agent loads it when it plans, files, reviews or finishes a batch. You do not call it. | [The cascade](https://github.com/arnelirobles/lean-agent/wiki/The-Cascade) |
-| `/lean-agent:shape-ticket` | Writes an issue in the agent-ready shape, after searching for one it belongs to. | [Shape the ticket](https://github.com/arnelirobles/lean-agent/wiki/Shape-the-Ticket) |
-| `/lean-agent:adversarial-review` | The critic: one agent hunts, a second tries to refute. | [Adversarial critic](https://github.com/arnelirobles/lean-agent/wiki/Adversarial-Critic) |
-| `/lean-agent:lean-retro` | The retro that changes the method from numbers. | [Self-improving retro](https://github.com/arnelirobles/lean-agent/wiki/Self-Improving-Retro) |
+| `tools` skill | Maps each plain step in the lean-agent skills to the tool here that does it. The agent loads it with the lean-agent skills. You do not call it. | [skills/tools/SKILL.md](skills/tools/SKILL.md) |
 | Scripts in `tools/` | Preflight, holdout, needs-review, cost, hygiene and more. Each has a `--self-test`. Holdout claims one hunk per binding (edits with no context between them count separately), uses `HOLDOUT_BASE` or the remote default branch, treats every changed file that is not a test, doc or lockfile as production, and takes space-separated `HOLDOUT_PRODUCTION` and `HOLDOUT_NOT_PRODUCTION` globs. | [Scripts](https://github.com/arnelirobles/lean-agent/wiki/Scripts) |
 | `test-phase` | Drains the test queue in brain through `heavy.sh` with a stall watchdog, one drainer at a time. Takes a plan file too (one project per line). Sorts failures into flaky and real, logs every command as a run, and writes the failures to brain. | [The cycle](#the-cycle) |
 | `brain` | A local SQLite list of open failures, deferred minors, questions, blockers, running agents and next steps, plus the test queue, with tags, runs and stats. `brain resume` prints what is open for a project, and `brain digest` a 2 KB summary of it (counts, blockers, questions, running jobs, stale agents). | [The cycle](#the-cycle) |
@@ -98,7 +67,7 @@ Update with `claude plugin update lean-agent@lean-agent`. Claude Code picks up a
 
 `tools/credit-run` runs one brief as a headless Agent SDK job paid by API credits, and `tools/credit-batch` sends single-shot briefs at batch prices, so a person on a subscription can spend credits without changing how they sign in. Setup, settings and limits are under Jobs on API credits below. Edit and Write are limited to the worktree and denied in git metadata, but an edit job is not a sandbox: the key is scrubbed from Bash and hook environments, yet `git commit` still runs the repository's hooks as you, so run jobs only in a repository you trust. The tool's cost figure does not prove which balance paid.
 
-Everything in the method still works without the plugin. Without it, run the scripts from `tools/` (for example `tools/holdout.sh`).
+The lean-agent skills work without this plugin. Without it, run the scripts from `tools/` by path (for example `tools/holdout.sh`).
 
 ## The cycle
 
@@ -372,28 +341,6 @@ Not covered:
 - libgit2 and scripts that call git
 - the public-remote check contacts whatever host a remote URL names, and needs the network; when it fails the other remote counts as private and the commits are scanned
 
-## The method
-
-| Section | Page | In one line |
-| --- | --- | --- |
-| 0 | [Shape the ticket for the agent](https://github.com/arnelirobles/lean-agent/wiki/Shape-the-Ticket) | Write each ticket so one agent pass finishes it with nothing else to read. |
-| 1 | [Triage inline, no agents](https://github.com/arnelirobles/lean-agent/wiki/Triage) | Sort the backlog yourself into three tiers and do tier 0 by hand. |
-| 2 | [The cascade](https://github.com/arnelirobles/lean-agent/wiki/The-Cascade) | A cheap model drafts, a cheap critic reviews, the strong model sees only what stays open. |
-| 3 | [The diff decides whether a critic runs](https://github.com/arnelirobles/lean-agent/wiki/When-the-Critic-Runs) | Rules over the diff, not the ticket title, decide whether a critic runs. |
-| 4 to 4a | [Scripts, not instructions](https://github.com/arnelirobles/lean-agent/wiki/Scripts-Not-Instructions) | Mechanical checks live in scripts. Reasoning an agent does twice becomes a script. |
-| 5 to 6 | [Rework and concurrency](https://github.com/arnelirobles/lean-agent/wiki/Rework-and-Concurrency) | Fixes go back to the agent that wrote the change. At most four changes in flight. |
-| 7 | [Measure every batch](https://github.com/arnelirobles/lean-agent/wiki/Measure-Every-Batch) | Cost per change and what the critic missed, after every batch. |
-| 8 | [Attack your own method](https://github.com/arnelirobles/lean-agent/wiki/Attack-Your-Own-Method) | Test the method against real defects before you trust it. |
-| 9 | [Half of what an agent makes is not text](https://github.com/arnelirobles/lean-agent/wiki/Non-Text-Output) | Gate images and other bytes that text checks cannot read. |
-| 10 | [A check that passes having checked nothing](https://github.com/arnelirobles/lean-agent/wiki/Checks-That-Check-Nothing) | Make every check fail when it is handed nothing to check. |
-| 11 | [The machine has a ceiling too](https://github.com/arnelirobles/lean-agent/wiki/Machine-Ceiling) | Queue heavy commands per toolchain and run agent work at the lowest priority. |
-| 12 | [The adversarial critic](https://github.com/arnelirobles/lean-agent/wiki/Adversarial-Critic) | One agent hunts, a second tries to prove each finding wrong. Repository rules first. |
-| 13 | [Every finding is an interaction](https://github.com/arnelirobles/lean-agent/wiki/Interaction-Surface) | Look at what the diff touches but did not write, before you push. |
-| 14 | [Cheap drafting works, and it stops short](https://github.com/arnelirobles/lean-agent/wiki/Cheap-Drafting) | Where a cheaper drafter holds up and where it stops. |
-| 14a to 14h | [Field notes from parallel agents](https://github.com/arnelirobles/lean-agent/wiki/Field-Notes) | Leftover processes, shared scratchpads, wait loops, stacked pull requests, deploys, rehearsals, local CI, steps for a person. |
-| 15 | [What a reader should observe](https://github.com/arnelirobles/lean-agent/wiki/What-to-Observe) | The six results to look for, and the two goals that poison themselves. |
-| 16 | [The method improves itself](https://github.com/arnelirobles/lean-agent/wiki/Self-Improving-Retro) | A scheduled retro that turns the numbers into changes to the method. |
-
 ## Data
 
 lean-agent has no service of its own and keeps nothing off your machine. What it stores stays local: the brain database (`~/.local/share/lean/brain.db`), test-phase logs (`~/.local/share/lean/test-phase`), stats (`~/.lean/lean.db`) and which script notes a session has seen (`~/.local/share/lean/script-note`, deleted after 14 days). The `commit-author` hook reads the git author email to check it and stores nothing. The `secret-scan` git hooks read the lines being committed or pushed and store nothing; the Claude hook reads the text being written and stores only that it blocked. The push check asks a remote's https address, without credentials, whether it is public.
@@ -416,14 +363,10 @@ It sends data to other services only through tools you already run, and only whe
 
 ## Contributing
 
-A change to `skills/`, `hooks/`, `tools/` or `lib/` moves the version in `.claude-plugin/plugin.json`, and the merge is tagged `v<version>`. `tests/run-all.sh` runs every `--self-test`, lists scripts that have none, and fails when those folders changed since the current version's tag. CI runs it on Ubuntu for every pull request.
+A change to `skills/`, `hooks/, `tools/` or `lib/` moves the version in `.claude-plugin/plugin.json`, and the merge is tagged `v<version>`. `tests/run-all.sh` runs every `--self-test`, lists scripts that have none, and fails when those folders changed since the current version's tag. CI runs it on Ubuntu for every pull request.
 
 A script that works on any repository belongs here, as a pull request with its test and a line on the [Scripts](https://github.com/arnelirobles/lean-agent/wiki/Scripts) page. See [Scripts, not instructions](https://github.com/arnelirobles/lean-agent/wiki/Scripts-Not-Instructions#4a-the-second-time-an-agent-reasons-its-way-through-something-it-becomes-a-script).
 
-## What this does not fix
-
-A backlog with no definition of finished refills faster than it drains. Automation widens the drain. It does not close the tap. Decide what done means first.
-
 ## Licence
 
-MIT. Take it, change it, ship it.
+MPL-2.0. See [LICENSE](LICENSE).

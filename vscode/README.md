@@ -32,5 +32,5 @@ The fonts in `media/fonts` (Plus Jakarta Sans, IBM Plex Mono) are licensed under
 ## Settings
 
 - `leanBrain.dbPath`: path to brain.db. Empty uses `LEAN_BRAIN_DB`, then `~/.local/share/lean/brain.db`.
-- `leanBrain.brainPath`: path to `tools/brain`. Empty uses `brain` on PATH, then the newest lean-agent plugin in `~/.claude/plugins/cache/lean-agent/lean-agent/*/tools/brain` (`bin/brain` for plugin versions before 1.16.0).
+- `leanBrain.brainPath`: path to `tools/brain`. Empty uses `brain` on PATH, then the newest lean-agent plugin in `~/.claude/plugins/cache/lean-agent-tools/lean-agent-tools/*/tools/brain` (`bin/brain` for plugin versions before 1.16.0).
 - `leanBrain.claudeCommand`: path to the claude executable. Empty uses the absolute PATH entries, then `~/.local/bin`, `~/.claude/local`, `/opt/homebrew/bin` and `/usr/local/bin`, since an editor started from the Dock does not get the shell's PATH.

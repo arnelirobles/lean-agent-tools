@@ -58,7 +58,7 @@ def path_line():
 
 def ours(line):
     """True for a PATH line this hook wrote: for this tools folder, or for another lean-agent version's in the
-    plugin cache (<...>/plugins/cache/<marketplace>/lean-agent/<version>/tools). Any other folder, a dev
+    plugin cache (<...>/plugins/cache/<marketplace>/lean-agent-tools/<version>/tools). Any other folder, a dev
     checkout included, belongs to someone else and stays."""
     m = PATH_LINE.fullmatch(line)
     if not m:
@@ -73,7 +73,7 @@ def ours(line):
     if folder == hookkit.TOOLS:
         return True
     p = folder.split(os.sep)
-    return len(p) >= 7 and p[-1] == "tools" and p[-3] == "lean-agent" and p[-5] == "cache" and p[-6] == "plugins"
+    return len(p) >= 7 and p[-1] == "tools" and p[-3] in ("lean-agent", "lean-agent-tools") and p[-5] == "cache" and p[-6] == "plugins"
 
 
 def _locked(env_file):
@@ -279,7 +279,7 @@ def self_test():
                              capture_output=True, text=True).stdout
         if got != "1|glue-1":
             fails.append(f"a file with no final newline must keep its last line apart from ours: {got!r}")
-        cache = os.path.join(d, "plugins", "cache", "mkt", "lean-agent")
+        cache = os.path.join(d, "plugins", "cache", "mkt", "lean-agent-tools")
         old_tools = os.path.join(cache, "1.16.0", "tools")
         os.makedirs(old_tools)
         with open(os.path.join(old_tools, "brain"), "w") as fh:

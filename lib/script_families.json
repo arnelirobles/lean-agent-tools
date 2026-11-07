@@ -17,10 +17,10 @@
     },
     {
       "name": "versioned-plugin-path",
-      "regex": "lean-agent/lean-agent/\\d+\\.\\d+\\.\\d+/(bin|tools|hooks|lib)/",
+      "regex": "lean-agent-tools/lean-agent-tools/\\d+\\.\\d+\\.\\d+/(bin|tools|hooks|lib)/",
       "raw": true,
       "kind": "method",
-      "covered_by": "scripts block in skills/method/SKILL.md"
+      "covered_by": "scripts block in skills/tools/SKILL.md"
     },
     {
       "name": "curl-smoke-check",

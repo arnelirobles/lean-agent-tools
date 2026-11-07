@@ -77,7 +77,7 @@ AZ_VALUE_FLAGS = {"--id", "--status", "--draft", "--organization", "--org", "--d
                   "--bypass-policy", "--bypass-policy-reason", "--merge-commit-message",
                   "--transition-work-items", "--output", "-o", "--query", "--subscription"}
 LOG_REVIEW = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..",
-                                           "skills", "adversarial-review", "log-review.sh"))
+                                           "tools", "log-review.sh"))
 DENY = (
     "Pull request {name} has no review logged in lean.db, which the retro reads. Run the review "
     "(adversarial-review), then log it with "

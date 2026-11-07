@@ -29,7 +29,7 @@ import forge  # noqa: E402
 import leanstats  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-LOG_REVIEW = os.path.join(ROOT, "skills", "adversarial-review", "log-review.sh")
+LOG_REVIEW = os.path.join(ROOT, "tools", "log-review.sh")
 REVIEW_COLUMNS = ("date", "repo", "pr", "confirmed", "refuted", "blockers", "categories",
                   "caught_elsewhere_first", "pre_push", "ci", "review", "escaped")
 

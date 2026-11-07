@@ -3,11 +3,11 @@
 
 Two rules, both from issue 68:
 
-1. No skill, full-text.md or the README names a script by the old ${CLAUDE_PLUGIN_ROOT}/bin/ or by a
+1. No skill or the README names a script by the old ${CLAUDE_PLUGIN_ROOT}/bin/ or by a
    versioned plugin path. Scripts live in tools/ and are on PATH when session-env ran; otherwise the path to use is
    ${CLAUDE_PLUGIN_ROOT}/tools/<name>, and a versioned path breaks after an upgrade.
 2. Every script in tools/ that has a --self-test is named in the "Scripts" block of
-   skills/method/SKILL.md. Only scripts that exist in tools/ are checked.
+   skills/tools/SKILL.md. Only scripts that exist in tools/ are checked.
 
   tests/scripts-findable.py              check this repository, exit 1 on a problem
   tests/scripts-findable.py --self-test  check the checks against small fixtures, then the repository
@@ -18,7 +18,7 @@ import re
 import sys
 
 ROOT = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
-METHOD = "skills/method/SKILL.md"
+METHOD = "skills/tools/SKILL.md"
 BLOCK_HEADING = "## Scripts\n"
 
 # Not commands an agent runs: the MCP server entry point and a shared module.
@@ -26,7 +26,7 @@ NOT_COMMANDS = {"brain-mcp", "lean_remote.py"}
 
 PATH_PATTERNS = [
     re.compile(r"\$\{?CLAUDE_PLUGIN_ROOT\}?\"?/bin/"),
-    re.compile(r"lean-agent/\d+\.\d+\.\d+/"),
+    re.compile(r"lean-agent(?:-tools)?/\d+\.\d+\.\d+/"),
     re.compile(r"plugins/cache/"),
 ]
 
@@ -71,7 +71,6 @@ def self_test_scripts(tools_dir):
 def check_repo():
     problems = []
     files = sorted(glob.glob(os.path.join(ROOT, "skills", "*", "SKILL.md")))
-    files.append(os.path.join(ROOT, "skills", "method", "full-text.md"))
     files.append(os.path.join(ROOT, "README.md"))
     for path in files:
         with open(path) as f:
@@ -99,7 +98,7 @@ def self_test():
     expect("quoted unbraced form", len(path_problems("x", 'run "$CLAUDE_PLUGIN_ROOT"/bin/brain')), 1)
     expect("versioned path", len(path_problems("x", "~/.claude/plugins/cache/x/lean-agent/1.9.0/bin/brain")), 1)
     expect("tools path", path_problems("x", "run ${CLAUDE_PLUGIN_ROOT}/tools/brain list"), [])
-    expect("skill path is not a bin path", path_problems("x", "${CLAUDE_PLUGIN_ROOT}/skills/method/full-text.md"), [])
+    expect("skill path is not a bin path", path_problems("x", "${CLAUDE_PLUGIN_ROOT}/skills/tools/SKILL.md"), [])
 
     doc = f"# t\n{BLOCK_HEADING}\n- `style-scan`: a\n- `a.sh <x>`: b\n- `c.sh`, `d.py`: e\n## Next\n- `missing.sh`: f\n"
     block = scripts_block(doc)
