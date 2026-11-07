@@ -237,6 +237,8 @@ RENAMED = [
     ("LEAN_SKIP_VERIFY_CLAIM=1, inline or in settings env, turns this note off.",
      "Set LEAN_SKIP_VERIFY_CLAIM=1 in the env block of your own settings (~/.claude/settings.json) "
      "to turn this note off."),
+    # lean-agent-tools: log-review.sh moved out of the skills folder
+    ("/skills/adversarial-review/log-review.sh", "/tools/log-review.sh"),
 ]
 
 
