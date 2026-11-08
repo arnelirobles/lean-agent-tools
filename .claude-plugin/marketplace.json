@@ -10,5 +10,6 @@
       "source": "./",
       "description": "Hooks, brain, scripted gates and test tools for the lean-agent skills."
     }
-  ]
+  ],
+  "description": "Hooks, brain, gates and test tools for the lean-agent skills plugin."
 }

@@ -3,7 +3,7 @@
 #
 # A script opts in by handling --self-test; this finds them by that string, so a
 # new hook or script is covered without editing this file. Each one gets 300
-# seconds. Scripts without a self-test are listed, so a new one that skipped its
+# seconds (tools/test-phase gets 900). Scripts without a self-test are listed, so a new one that skipped its
 # test shows up here. The plugin's JSON files are also checked for duplicate keys:
 # a text merge can leave two "PostToolUse" keys, which still parses, and the
 # parser silently keeps only the last. Run it from anywhere: tests/run-all.sh
@@ -31,10 +31,18 @@ if [ "${#scripts[@]}" -eq 0 ]; then
 fi
 
 # macOS has no timeout unless coreutils is installed, as gtimeout. Without either the self-tests
-# still run, only without the 300 second cap.
+# still run, only without the cap. The cap is 300 seconds, except for tools/test-phase, whose
+# self-test alone takes close to that on a slow runner.
+cap_for() {
+  case "$1" in
+    tools/test-phase) echo 900 ;;
+    *) echo 300 ;;
+  esac
+}
 limit() {
-  if command -v timeout >/dev/null 2>&1; then timeout 300 "$@"
-  elif command -v gtimeout >/dev/null 2>&1; then gtimeout 300 "$@"
+  local secs=$1; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"
   else "$@"; fi
 }
 
@@ -87,7 +95,11 @@ for script in "${scripts[@]}"; do
     *.sh) runner=(bash "$script") ;;
     *) runner=("./$script") ;;
   esac
-  out=$(limit "${runner[@]}" --self-test 2>&1); rc=$?
+  cap=$(cap_for "$script")
+  out=$(limit "$cap" "${runner[@]}" --self-test 2>&1); rc=$?
+  # timeout exits 124 when it stops the command, which otherwise shows as a blank failure.
+  [ "$rc" = 124 ] && out="${out:+$out
+}timed out after ${cap} s"
   if [ "$rc" = 0 ]; then
     echo "ok   $script"
   elif [ "$rc" = 77 ]; then
