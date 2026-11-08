@@ -1,6 +1,6 @@
 {
   "name": "lean-agent-tools",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Adds hooks, the brain MCP server, scripted gates and test tools to the lean-agent skills. Install it alongside the lean-agent plugin.",
   "author": {
     "name": "Arnel Robles",

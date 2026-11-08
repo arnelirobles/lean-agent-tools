@@ -191,10 +191,8 @@ run_lane() { # $1 lane, rest: command
 }
 
 self_suite() { # runs the lane tests with the current HEAVY_BACKEND; prints failures, returns their count
-  local fails=0 holder out rc i hold=7
+  local fails=0 holder out rc i
   holder=""
-  # lsof takes a couple of seconds a call, so the holder has to outlast several of them.
-  [ -d /proc/self ] || hold=25
   export HEAVY_LOCK_DIR="$t/locks"
   out=$( (run_lane l1 sh -c 'exit 3') 2>&1 ); rc=$?
   [ "$rc" = 3 ] || { echo "self-test failed: command exit code not passed through ($rc)"; fails=$((fails + 1)); }
@@ -208,26 +206,31 @@ self_suite() { # runs the lane tests with the current HEAVY_BACKEND; prints fail
   { [ "$rc" = 0 ] && [ "$out" = free ]; } || { echo "self-test failed: idle lane did not read free: $rc '$out'"; fails=$((fails + 1)); }
 
   # Hold the lane the way heavy.sh does, so the holder is the lock process and the work is its child.
-  (run_lane l2 sleep $hold </dev/null >/dev/null 2>&1) &
+  # It keeps the lane until the release file appears and writes the up file once it runs, which is
+  # after it took the lock, so no check depends on how long the holder lives.
+  rm -f "$t/l2.up" "$t/l2.release"
+  (run_lane l2 sh -c ': > "$1"; while [ ! -e "$0" ]; do sleep 0.2; done' "$t/l2.release" "$t/l2.up" </dev/null >/dev/null 2>&1) &
   holder=$!
   # Poll for the holder itself, not just a busy lock: run_lane's own probe holds the lock for an
   # instant before the real lock is taken, and a check that landed there found no holder (CI).
   for i in $(seq 1 50); do
     out=$(lock_holders "$HEAVY_LOCK_DIR/l2.lock")
-    grep -q "running pid [0-9]*: .*sleep $hold" <<<"$out" && break
+    grep -q "running pid [0-9]*: .*l2.release" <<<"$out" && break
     sleep 0.1
   done
-  grep -q "running pid [0-9]*: .*sleep $hold" <<<"$out" || { echo "self-test failed: the holder's command not listed: '$out'"; fails=$((fails + 1)); }
+  for i in $(seq 1 150); do [ -e "$t/l2.up" ] && break; sleep 0.2; done
+  grep -q "running pid [0-9]*: .*l2.release" <<<"$out" || { echo "self-test failed: the holder's command not listed: '$out'"; fails=$((fails + 1)); }
   out=$(bash "$HEAVY_SELF" status l2); rc=$?
-  { [ "$rc" = 1 ] && grep -q '^busy' <<<"$out" && grep -q "sleep $hold" <<<"$out"; } || { echo "self-test failed: busy lane did not read busy with its holder: $rc '$out'"; fails=$((fails + 1)); }
+  { [ "$rc" = 1 ] && grep -q '^busy' <<<"$out" && grep -q "l2.release" <<<"$out"; } || { echo "self-test failed: busy lane did not read busy with its holder: $rc '$out'"; fails=$((fails + 1)); }
   # Linux runs this suite twice, so clear the file the first pass left.
   rm -f "$t/ran"
   out=$( (HEAVY_WAIT=1 run_lane l2 touch "$t/ran") 2>&1 ); rc=$?
   [ "$rc" = 75 ] || { echo "self-test failed: timeout exit was $rc, want 75"; fails=$((fails + 1)); }
   grep -q "timed out after 1s waiting for lane 'l2'" <<<"$out" || { echo "self-test failed: no timeout message: $out"; fails=$((fails + 1)); }
-  { [ "$(grep -c 'Held by' <<<"$out")" = 2 ] && grep -q "running pid [0-9]*: .*sleep $hold" <<<"$out"; } || { echo "self-test failed: holders not printed once while waiting and once at timeout: $out"; fails=$((fails + 1)); }
+  { [ "$(grep -c 'Held by' <<<"$out")" = 2 ] && grep -q "running pid [0-9]*: .*l2.release" <<<"$out"; } || { echo "self-test failed: holders not printed once while waiting and once at timeout: $out"; fails=$((fails + 1)); }
   [ ! -e "$t/ran" ] || { echo "self-test failed: the command ran without the lock"; fails=$((fails + 1)); }
-  out=$( (HEAVY_WAIT=$((hold + 10)) run_lane l2 touch "$t/ran") 2>&1 ); rc=$?
+  : > "$t/l2.release"
+  out=$( (HEAVY_WAIT=30 run_lane l2 touch "$t/ran") 2>&1 ); rc=$?
   { [ "$rc" = 0 ] && [ -e "$t/ran" ]; } || { echo "self-test failed: lane did not run once free: $rc $out"; fails=$((fails + 1)); }
   wait "$holder" 2>/dev/null
   out=$(bash "$HEAVY_SELF" status l2); rc=$?
