@@ -617,19 +617,22 @@ def tool_input(event):
     return value if isinstance(value, dict) else {}
 
 
-def _emit(event_name, text):
+def _emit(event_name, text, user=None):
     _state.emitted = True
-    print(json.dumps({"hookSpecificOutput": {
-        "hookEventName": event_name, "additionalContext": text}}))
+    out = {"hookSpecificOutput": {"hookEventName": event_name, "additionalContext": text}}
+    if user:
+        out["systemMessage"] = user
+    print(json.dumps(out))
     sys.stdout.flush()
 
 
-def note(event_name, text):
-    """Print a non-blocking note that Claude reads with the tool result. Waiting guard notes join it."""
+def note(event_name, text, user=None):
+    """Print a non-blocking note that Claude reads with the tool result. Waiting guard notes join it.
+    `user` is also shown to the person, for what only they can fix."""
     if _state.guard_text and not _state.emitted:
         waiting = _take_guard()
         text = text + ("\n" + waiting if waiting else "")
-    _emit(event_name, text)
+    _emit(event_name, text, user)
     _fire("note")
     _keep_notice(text)
 
