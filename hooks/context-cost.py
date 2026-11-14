@@ -11,6 +11,9 @@ PostToolUse (notes):
     coordinator, Read included: send them to lean:search on the fast model
   - with LEAN_IMAGE_MODE=note, a note after the first image tool result of a turn (Read of an
     image file or a pdf with pages, a screenshot or thumbnail tool) once context is above LEAN_IMAGE_CONTEXT tokens (default 60000)
+  - once per compaction, when the size right after it leaves under LEAN_COMPACT_ROOM tokens
+    (default 40000) before the next auto-compaction: Autocompact thrashing comes next. It is also shown
+    to the person, since only they can raise CLAUDE_CODE_AUTO_COMPACT_WINDOW or turn off plugins
 PreToolUse (blocks, exit 2 with the reason on stderr, both off by default):
   - LEAN_LOOKUP_MODE=block: an Opus coordinator that has made more than LEAN_LOOKUP_WARN
     read-only lookups since it last started an Agent has the next Grep, Glob or Bash grep, rg,
@@ -26,6 +29,7 @@ The counters stay when a session is resumed.
   LEAN_LOOKUP_MODE=block  refuse lookups past the count instead of noting once (default note)
   LEAN_IMAGE_MODE=block   refuse image tools above LEAN_IMAGE_CONTEXT (default note)
   LEAN_IMAGE_CONTEXT=off  turn off the image note and block (a number sets the size)
+  LEAN_COMPACT_ROOM=off   turn off the compaction-room note (a number sets the room, default 40000)
   context-cost.py --self-test
 """
 import json
@@ -50,6 +54,7 @@ HOOK = {
     "events": [
         {"event": "PostToolUse", "group": 2, "order": 0},
         {"event": "PreToolUse", "group": 0, "order": 0},
+        {"event": "SessionStart", "matcher": "compact", "group": 4, "order": 0},
     ],
     "timeout": 10,
     "mode": "process",
@@ -61,6 +66,13 @@ HOOK = {
 CONTEXT_DEFAULT = 100000
 LOOKUP_DEFAULT = 10
 IMAGE_DEFAULT = 60000
+ROOM_DEFAULT = 40000
+MODEL_WINDOW = 200000  # the usual model window, assumed when none is set
+WINDOW_MIN, WINDOW_MAX = 100000, 1000000
+# Measured on 1,633 auto-compactions: the window set to 120k compacted at 85k to 90k, the 200k
+# default at about 165k. Claude Code does not document the gap, so this is the observed one.
+COMPACT_GAP = 33000
+SHRINK = 0.85  # backs up the SessionStart mark, for a session that compacted before this hook was on
 AGENT_TOOLS = {"Agent", "Task"}
 
 
@@ -203,6 +215,48 @@ def context_note(last, state, limit):
             "open with `brain add` and start a fresh session.")
 
 
+def compact_window():
+    """CLAUDE_CODE_AUTO_COMPACT_WINDOW (120000 or 120k) when it is set and in the documented 100000 to
+    1000000 range, else None: the model's own window, which a hook cannot know (200k or 1M)."""
+    value = (os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") or "").strip().lower()
+    scale = 1000 if value.endswith("k") else 1
+    try:
+        number = int(value[:-1] if scale > 1 else value) * scale
+    except ValueError:
+        return None
+    return number if WINDOW_MIN <= number <= WINDOW_MAX else None
+
+
+def room_note(last, state, room):
+    """Once per compaction: the size right after it leaves under `room` tokens of work before the next
+    auto-compaction, which is how Autocompact thrashing starts. Updates state."""
+    size = leanstats.prompt_size(last)
+    peak = state.get("peak")
+    compacted = state.get("compacted", False) and last["id"] != state.get("before_compact")
+    if compacted:
+        state.pop("compacted")
+    window = compact_window()
+    # A shrink without the SessionStart mark counts only under a set window: on a 1M model a big drop
+    # need not be a compaction, and the 200k guess would be wrong there.
+    dropped = compacted or (window is not None and peak is not None and size < peak * SHRINK)
+    state["peak"] = size if peak is None or dropped else max(peak, size)
+    if not dropped:  # the first turn seen may be mid-session, so only a compaction counts
+        return None
+    trigger = (window or MODEL_WINDOW) - COMPACT_GAP
+    left = trigger - size
+    if room is None or left >= room:
+        return None
+    if window is None:
+        fix = ("The model's own window is in use, so turn off plugins and MCP servers this project does not use "
+               "(/context shows what loads).")
+    else:
+        fix = (f"Raise or remove CLAUDE_CODE_AUTO_COMPACT_WINDOW ({window // 1000}k is too small), or turn off plugins "
+               "and MCP servers this project does not use (/context shows what loads).")
+    return (f"This session starts each round at {size // 1000}k tokens and auto-compacts near {trigger // 1000}k, "
+            f"so {max(left, 0) // 1000}k is left for work. Compaction will thrash. {fix} "
+            "LEAN_COMPACT_ROOM=off turns this note off.")
+
+
 def lookup_note(event, last, state, limit):
     """Count a read-only lookup by an Opus coordinator and return the note once the count is reached."""
     if limit is None or "opus" not in last["model"]:
@@ -273,6 +327,16 @@ def main():
     path = event.get("transcript_path")
     if not SESSION_ID.fullmatch(sid) or not isinstance(path, str) or is_subagent(event, path):
         return 0
+    if event.get("hook_event_name") == "SessionStart":  # source compact: the next turn's size is the floor
+        try:
+            last = leanstats.last_usage(path)
+            with Locked(sid):
+                state = load(sid)
+                state["compacted"], state["before_compact"] = True, last["id"] if last else ""
+                save(sid, state)
+        except (OSError, ValueError):
+            pass
+        return 0
     if event.get("hook_event_name") == "PreToolUse":
         try:
             return pre(event, sid)
@@ -280,7 +344,8 @@ def main():
             return 0
     limit, lookups = setting("LEAN_CONTEXT_WARN", CONTEXT_DEFAULT), setting("LEAN_LOOKUP_WARN", LOOKUP_DEFAULT)
     pictures = setting("LEAN_IMAGE_CONTEXT", IMAGE_DEFAULT) if mode("LEAN_IMAGE_MODE") == "note" else None
-    if limit is None and lookups is None and pictures is None:
+    room = setting("LEAN_COMPACT_ROOM", ROOM_DEFAULT)
+    if limit is None and lookups is None and pictures is None and room is None:
         return 0
     last = leanstats.last_usage(path)
     if not last:
@@ -288,13 +353,14 @@ def main():
     try:
         with Locked(sid):
             state = load(sid)
-            notes = [n for n in (context_note(last, state, limit), lookup_note(event, last, state, lookups),
+            tight = room_note(last, state, room)
+            notes = [n for n in (tight, context_note(last, state, limit), lookup_note(event, last, state, lookups),
                                  image_note(event, last, state, pictures)) if n]
             save(sid, state)
     except (OSError, ValueError):
         return 0
     if notes:
-        hookkit.note("PostToolUse", " ".join(notes))
+        hookkit.note("PostToolUse", " ".join(notes), user=tight)
     return 0
 
 
@@ -311,10 +377,11 @@ def self_test():
 
     with tempfile.TemporaryDirectory() as tmp:
         names = ("LEAN_CONTEXT_WARN", "LEAN_LOOKUP_WARN", "LEAN_LOOKUP_MODE", "LEAN_IMAGE_MODE", "LEAN_IMAGE_CONTEXT",
-                 "LEAN_DB", "LEAN_STATS", "HOME")
+                 "LEAN_COMPACT_ROOM", "CLAUDE_CODE_AUTO_COMPACT_WINDOW", "LEAN_DB", "LEAN_STATS", "HOME")
         saved = {k: os.environ.get(k) for k in names}
-        for k in names[:7]:
+        for k in names[:9]:
             os.environ.pop(k, None)
+        os.environ["LEAN_COMPACT_ROOM"] = "off"  # the room note has its own checks below
         os.environ["HOME"] = os.path.join(tmp, "home")
         os.environ["LEAN_DB"] = os.path.join(tmp, "lean.db")
         try:
@@ -548,6 +615,81 @@ def self_test():
             os.environ["LEAN_CONTEXT_WARN"] = "0"
             check("a setting of 0 turns the context note off", fire(300000, sid="sess-16")[1], "")
             del os.environ["LEAN_CONTEXT_WARN"]
+
+            del os.environ["LEAN_COMPACT_ROOM"]
+
+            def room(size, sid, **kw):
+                code, text, err = fire(size, sid=sid, **kw)
+                return text if "Compaction will thrash" in text else ""
+
+            def user_line(size, sid):
+                with open(transcript, "a") as fh:
+                    fh.write(turn(size))
+                event = {"session_id": sid, "transcript_path": transcript, "tool_name": "Edit", "tool_input": {},
+                         "hook_event_name": "PostToolUse"}
+                old, out = sys.stdin, io.StringIO()
+                sys.stdin = io.StringIO(json.dumps(event))
+                try:
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                        main()
+                finally:
+                    sys.stdin = old
+                return json.loads(out.getvalue()).get("systemMessage", "") if out.getvalue() else ""
+
+            room(150000, "rm-1")
+            check("the model's own window leaves room after a compaction to 70k", room(70000, "rm-1"), "")
+            os.environ["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = "120000"
+            check("the first turn seen is never a floor, it may be mid-session", room(131000, "rm-2"), "")
+            text = room(65000, "rm-2")
+            check("a compaction to 65k under a 120k window notes how little is left",
+                  ("starts each round at 65k" in text, "near 87k" in text, "22k is left" in text,
+                   "(120k is too small)" in text, "LEAN_COMPACT_ROOM=off" in text), (True,) * 5)
+            check("the note is said once per floor", room(75000, "rm-2"), "")
+            check("growing within a round stays quiet", room(86000, "rm-2"), "")
+            check("a small dip is not a compaction", room(80000, "rm-2"), "")
+            room(87000, "rm-2")
+            check("a compaction at 87k to 63k notes", "starts each round at 63k" in room(63000, "rm-2"), True)
+            room(87000, "rm-2")
+            check("the compaction mark is quiet itself", fire(87000, sid="rm-2", phase="SessionStart", append=False), (0, "", ""))
+            check("a turn before the next answer is not the floor yet", room(87000, "rm-2", append=False), "")
+            check("after the mark a small drop is the floor", "starts each round at 81k" in room(81000, "rm-2"), True)
+            check("a used mark is gone, the next turn is quiet", room(84000, "rm-2"), "")
+            room(95000, "rm-2")
+            fire(95000, sid="rm-2", phase="SessionStart", append=False)
+            check("a floor past the trigger says 0k is left, never less", "so 0k is left" in room(90000, "rm-2"), True)
+            room(87000, "rm-2")
+            check("a compaction to a low floor is quiet", room(40000, "rm-2"), "")
+            room(100000, "rm-2")
+            check("a compaction to a high floor notes again", "starts each round at 49k" in room(49000, "rm-2"), True)
+            room(150000, "rm-3")
+            check("a drop of 15% or more is a compaction and notes", "starts each round at 60k" in room(60000, "rm-3"), True)
+            user_line(150000, "rm-4")
+            check("the window text names the setting", "Raise or remove CLAUDE_CODE_AUTO_COMPACT_WINDOW (120k"
+                  in room(150000, "rm-3b") + room(70000, "rm-3b"), True)
+            check("the person sees it too", "Compaction will thrash" in user_line(65000, "rm-4"), True)
+            check("other notes do not reach the person", user_line(10000, "rm-5"), "")
+            os.environ["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = "160k"
+            for sid in ("rm-6", "rm-7", "rm-8", "rm-9", "rm-10"):
+                room(200000, sid)
+            check("a k suffix is read", room(70000, "rm-6"), "")
+            check("and still notes a floor too big for it", "near 127k" in room(99000, "rm-7"), True)
+            for bad in ("junk", "", "0", "30000", "2000000"):
+                os.environ["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = bad
+                check("window %r is not read" % bad, compact_window(), None)
+            os.environ["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = "junk"
+            check("a junk window is the model's", room(70000, "rm-8"), "")
+            room(200000, "rm-8")
+            check("with no window read a shrink alone is quiet", room(150000, "rm-8"), "")
+            fire(150000, sid="rm-8", phase="SessionStart", append=False)
+            text = room(140000, "rm-8")
+            check("a marked compaction with no window read notes, without blaming the setting",
+                  ("near 167k" in text, "model's own window" in text, "Raise or remove" in text), (True, True, False))
+            os.environ["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = "120000"
+            os.environ["LEAN_COMPACT_ROOM"] = "10000"
+            check("the room is a setting", room(70000, "rm-9"), "")
+            os.environ["LEAN_COMPACT_ROOM"] = "off"
+            check("and can be turned off", room(85000, "rm-10"), "")
+            del os.environ["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]
 
             folder = os.path.join(tmp, "context-cost")
             check("the counters sit next to the database, private", (os.path.dirname(state_path("sess-7")) == folder,
