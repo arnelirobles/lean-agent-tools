@@ -4,6 +4,7 @@ State is a JSON file at $FAKE_BRAIN_STATE ({"next_id": N, "items": [...]}). Each
 as one JSON line to $FAKE_BRAIN_LOG. Environment:
   FAKE_BRAIN_VERSION  text printed for --version (default "brain 1.0.0"); "exit2" mimics an old brain
   FAKE_BRAIN_SLEEP    seconds to sleep before any call except --version
+  FAKE_BRAIN_VERSION_SLEEP  seconds to sleep before answering --version (a slow probe)
   FAKE_BRAIN_RAW      printed verbatim by `list --json` instead of the items
 Modeled: --version, add, list --json, close, session infer --json. Any other subcommand reads stdin,
 logs argv, prints a fresh integer id and exits 0.
@@ -62,6 +63,9 @@ def main(argv, stdin=None):
         with open(log, "a") as f:
             f.write(json.dumps(argv) + "\n")
     if argv == ["--version"]:
+        vdelay = env.get("FAKE_BRAIN_VERSION_SLEEP")
+        if vdelay:
+            time.sleep(float(vdelay))
         text = env.get("FAKE_BRAIN_VERSION", "brain 1.0.0")
         if text == "exit2":
             sys.stderr.write("brain: error: unrecognized arguments: --version\n")

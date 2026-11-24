@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 MIN_VERSION = (1, 0, 0)
 VERSION_TIMEOUT = 5
@@ -21,6 +22,10 @@ PREFIX = "lean-agent-tools: brain failed: "
 
 _cache = None
 _warned = set()
+
+
+class _OutOfTime(Exception):
+    pass
 
 
 def reset():
@@ -33,11 +38,20 @@ def _warn(msg):
     sys.stderr.write(msg.replace("\n", " ").strip() + "\n")
 
 
-def _version_ok(path, env):
+def _version_ok(path, env, deadline=None):
+    limit = VERSION_TIMEOUT
+    if deadline is not None:
+        limit = min(limit, deadline - time.monotonic())
+        if limit <= 0:
+            raise _OutOfTime()
     try:
         r = subprocess.run([sys.executable, path, "--version"], capture_output=True, text=True,
-                           timeout=VERSION_TIMEOUT, env=env)
-    except (OSError, subprocess.TimeoutExpired):
+                           timeout=limit, env=env)
+    except OSError:
+        return False
+    except subprocess.TimeoutExpired:
+        if limit < VERSION_TIMEOUT:
+            raise _OutOfTime()
         return False
     m = re.match(r"brain (\d+)\.(\d+)\.(\d+)\s*$", r.stdout) if r.returncode == 0 else None
     return bool(m) and tuple(int(x) for x in m.groups()) >= MIN_VERSION
@@ -52,7 +66,9 @@ def _cache_candidates(home):
     return [p for _, p in sorted(found, reverse=True)]
 
 
-def find_brain(env=None, home=None):
+def find_brain(env=None, home=None, timeout=None):
+    """Return the path of a usable brain, or None. With timeout, discovery stops when it runs out:
+    one stderr line, None, and nothing is cached, so a later call with more time can still find it."""
     global _cache
     default = env is None and home is None
     if default and _cache:
@@ -64,8 +80,14 @@ def find_brain(env=None, home=None):
     if on_path:
         cands.append(on_path)
     cands += [p for p in _cache_candidates(h) if p not in cands]
+    deadline = None if timeout is None else time.monotonic() + timeout
     for path in cands:
-        if _version_ok(path, dict(e)):
+        try:
+            ok = _version_ok(path, dict(e), deadline)
+        except _OutOfTime:
+            _warn(f"{PREFIX}discovery timed out after {timeout}s")
+            return None
+        if ok:
             if default:
                 _cache = path
             return path
@@ -76,9 +98,12 @@ def find_brain(env=None, home=None):
 
 
 def call(args, stdin=None, timeout=None):
-    path = find_brain()
+    start = time.monotonic()
+    path = find_brain(timeout=timeout)
     if not path:
         return None
+    if timeout is not None:
+        timeout = max(timeout - (time.monotonic() - start), 0.01)
     try:
         r = subprocess.run([sys.executable, path] + list(args), input=stdin, capture_output=True,
                            text=True, timeout=timeout)
@@ -210,6 +235,20 @@ def self_test():
             check("timeout returns within 2 seconds", time.time() - t0 < 2)
             check("timeout writes one line naming it", len(err) == 1 and err[0].startswith(PREFIX)
                   and "timed out" in err[0])
+
+            # a slow probe counts against the call timeout and is not cached
+            vslow = fakebrain.install_fake(os.path.join(d, "vslow"), {"FAKE_BRAIN_VERSION_SLEEP": "5"})
+            os.environ["PATH"] = os.path.dirname(vslow)
+            t0 = time.time()
+            got, err = run(lambda: call(["list", "--json"], timeout=1))
+            check("slow probe returns None within the call timeout", got is None and time.time() - t0 < 2)
+            check("slow probe writes one failed line", len(err) == 1 and err[0].startswith(PREFIX)
+                  and "timed out" in err[0])
+            reset()
+            with contextlib.redirect_stderr(io.StringIO()):
+                find_brain(timeout=0.2)
+            check("a timed-out discovery is not cached", _cache is None)
+            reset()
 
             # --version is never slowed, so a slow brain is still found
             got, err = run(lambda: find_brain({"PATH": os.path.dirname(slow)}, home0))
