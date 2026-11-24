@@ -1246,6 +1246,9 @@ def testq_run(argv):
                 rc = 0 if e.code is None else 1
                 if e.code is not None:
                     err.write(str(e.code) + "\n")
+        except Exception as e:  # noqa: BLE001  a locked database or a bug must read as a failed call, as a brain failure did
+            rc = 1
+            err.write(repr(e) + "\n")
     finally:
         out_t._local.buf = err_t._local.buf = None
     return rc or 0, out.getvalue(), err.getvalue()
@@ -3026,6 +3029,25 @@ def brainless_checks(fails):
             except OSError:
                 return []
             return [c for c in (json.loads(x) for x in lines) if c != ["--version"]]
+
+        # An error inside the in-process queue is a failed call (None, error text on stderr), not a crash.
+        from testq import cli as tcli
+        real_fn, seen_err = tcli.cmd_queue, io.StringIO()
+
+        def locked(_a):
+            raise sqlite3.OperationalError("database is locked")
+
+        tcli.cmd_queue = locked
+        real_stderr, sys.stderr = sys.stderr, seen_err
+        try:
+            got = queue_cli(["list"])
+        except Exception as e:  # noqa: BLE001
+            got = e
+        finally:
+            sys.stderr = real_stderr
+            tcli.cmd_queue = real_fn
+        if got is not None or "database is locked" not in seen_err.getvalue():
+            fails.append(f"a queue error must give None with the text on stderr, not raise: {got!r} {seen_err.getvalue()!r}")
 
         failing = "  Failed Fx.Tests.Breaks [1 ms]\n   Assert.Equal() Failure\nFailed!  - Failed: 1, Passed: 0, Skipped: 0, Total: 1\n"
         passing = "Passed!  - Failed:     0, Passed:     5, Skipped:     0, Total:     5\n"
