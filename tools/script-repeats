@@ -326,6 +326,8 @@ def self_test():
     assert hit("cd app && dotnet test X.sln | tail -5") == ["direct-test-run"]
     assert hit("brain queue add r p --filter X && dotnet test --list-tests") == ["direct-test-run"]
     assert hit("brain queue add r p --filter 'ATests|BTests'") == []
+    assert hit("test-phase queue add r p --filter X && dotnet test --list-tests") == ["direct-test-run"]
+    assert hit("test-phase queue add r p --filter 'ATests|BTests'") == []
     assert hit("test-phase") == []
     assert hit("grep -rn '%s' docs" % em) == ["style-slop-grep"]
     assert hit("python3 - <<'X'\ns=open(p).read()\ns=s.replace(a,b)\nX") == ["inline-python-replace"]

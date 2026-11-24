@@ -1,7 +1,7 @@
 {
   "name": "lean-agent-tools",
-  "version": "1.0.3",
-  "description": "Adds hooks, the brain MCP server, scripted gates and test tools to the lean-agent skills. Install it alongside the lean-agent plugin.",
+  "version": "2.0.0",
+  "description": "Adds hooks, scripted gates, the test queue and test tools to the lean-agent skills. Install it alongside the lean-agent plugin. Brain is a separate plugin.",
   "author": {
     "name": "Arnel Robles",
     "url": "https://github.com/arnelirobles"
@@ -10,22 +10,8 @@
   "repository": "https://github.com/arnelirobles/lean-agent-tools",
   "license": "MPL-2.0",
   "mcpServers": {
-    "brain": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/tools/brain-mcp"
-    }
-  },
-  "userConfig": {
-    "serve_mode": {
-      "type": "string",
-      "title": "Brain page",
-      "description": "When the brain page server runs: always (from login, after brain serve --install always), session (started with a session, stops 30 minutes after the last one), or manual (brain serve)",
-      "default": "manual"
-    },
-    "worktree_roots": {
-      "type": "string",
-      "title": "Worktree folders",
-      "description": "Comma-separated folders the brain page searches for git worktrees, besides the repositories brain already knows",
-      "default": ""
+    "tests": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/tools/tests-mcp"
     }
   }
 }

@@ -52,7 +52,7 @@
       "per_segment": true,
       "exclude": "test-phase|heavy\\.sh|brain queue",
       "covered_by": "test-phase",
-      "usage": "queues tests in one lane so failures reach brain. Run `brain queue add <repo> <project> --filter ...`, then `test-phase`."
+      "usage": "queues tests in one lane so failures reach brain. Run `test-phase queue add <repo> <project> --filter ...`, then `test-phase`."
     },
     {
       "name": "package-version-lookup",

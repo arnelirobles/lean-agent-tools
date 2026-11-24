@@ -10,6 +10,8 @@ web page lists. It never blocks.
   LEAN_CREATED_LOG=off   turn it off
   created-log.py --self-test
 """
+import contextlib
+import io
 import json
 import os
 import re
@@ -17,6 +19,7 @@ import sys
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import brainlink  # noqa: E402
 import hookkit  # noqa: E402
 
 HOOK = {
@@ -135,8 +138,8 @@ def response_text(resp):
 
 
 def record(command, cwd, output, session_id):
-    """Save the first created item in COMMAND; return its URLs. Never raises, never exits, and opens the
-    database only when there is something to save."""
+    """Save the first created item in COMMAND through the brain command; return its URLs. Never raises, never exits,
+    and runs brain only when there is something to save."""
     found = None
     for seg in hookkit.segments(command, cwd):
         found = parse_created(seg.words, output)
@@ -145,15 +148,20 @@ def record(command, cwd, output, session_id):
     if not found:
         return []
     try:
-        from brain import records, store
         branch = hookkit.git(seg.cwd, "rev-parse", "--abbrev-ref", "HEAD") or ""
-        con = store.connect(timeout=1)
-        records.add_created(con, found["kind"], found["forge"], found["repo"], branch, found["url"],
-                            found["number"], found["title"], session_id, seg.cwd)
-        return [found["url"]]
-    except (SystemExit, Exception) as exc:  # a locked or newer database must not fail the tool call
-        print(f"lean-agent created-log skipped: {exc!r}", file=sys.stderr)
+        args = ["created", "add", "--kind", found["kind"], "--forge", found["forge"]]
+        args += hookkit.flag_args("--url", found["url"])
+        if found["number"] is not None:
+            args += ["--number", str(found["number"])]
+        for name, value in (("--repo", found["repo"]), ("--branch", branch), ("--title", found["title"]),
+                            ("--session", session_id), ("--cwd", seg.cwd)):
+            if value:
+                args += hookkit.flag_args(name, value)
+        with contextlib.redirect_stderr(io.StringIO()):
+            saved = brainlink.call(args, timeout=1)
+    except (SystemExit, Exception):  # a missing or failing brain must not fail the tool call
         return []
+    return [found["url"]] if saved is not None else []
 
 
 def main():
@@ -169,7 +177,6 @@ def main():
 
 
 def self_test():
-    import sqlite3
     import subprocess
     import tempfile
     import time
@@ -222,42 +229,89 @@ def self_test():
     check("az pr foreign host", parse("az repos pr create", '{"pullRequestId": 7, "repository": {"webUrl": "https://evil.example/org/p/_git/r"}}'), None)
     check("az bad json", parse("az repos pr create", "WARNING"), None)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        os.environ["LEAN_BRAIN_DB"] = os.path.join(tmp, "brain.db")
-        cmd = "gh pr create --fill"
-        from brain import store
-        check("record", record(cmd, tmp, out, "s1"), ["https://github.com/o/r/pull/12"])
-        check("record twice", len(record(cmd, tmp, out, "s1")), 1)
-        rows = store.connect().execute("SELECT kind, number, session_id, cwd FROM created").fetchall()
-        check("one row", [tuple(r) for r in rows], [("pr", 12, "s1", tmp)])
-        check("failed create not recorded", record(cmd, tmp, "nope", "s1"), [])
-        os.environ["LEAN_BRAIN_DB"] = os.path.join(tmp, "none", "never.db")
-        check("no create opens no database", record("gh pr list", tmp, out, "s1"), [])
-        check("no database file made", os.path.exists(os.path.join(tmp, "none")), False)
-        newer = os.path.join(tmp, "newer.db")
-        con = sqlite3.connect(newer)
-        con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        con.execute("INSERT INTO meta VALUES ('schema_version', '99')")
-        con.commit()
-        con.close()
-        os.environ["LEAN_BRAIN_DB"] = newer
-        check("newer schema does not exit", record(cmd, tmp, out, "s1"), [])
-        locked = os.path.join(tmp, "locked.db")
-        os.environ["LEAN_BRAIN_DB"] = locked
-        store.connect().close()
-        holder = sqlite3.connect(locked, isolation_level=None)
-        holder.execute("BEGIN EXCLUSIVE")
-        t0 = time.time()
-        check("locked database gives up", record(cmd, tmp, out, "s1"), [])
-        check("locked database waits about a second", time.time() - t0 < 5, True)
-        holder.close()
-        ev = os.path.join(tmp, "ev.json")
-        with open(ev, "w") as fh:
-            json.dump({"session_id": "s", "cwd": tmp, "tool_input": {"command": cmd},
-                       "tool_response": {"stdout": out}}, fh)
-        os.environ["LEAN_BRAIN_DB"] = newer
-        done = subprocess.run([sys.executable, os.path.realpath(__file__)], stdin=open(ev), capture_output=True)
-        check("hook exits 0 on a newer schema", done.returncode, 0)
+    from testq import fakebrain
+
+    def lines(path):
+        if not os.path.exists(path):
+            return []
+        with open(path) as fh:
+            return [json.loads(ln) for ln in fh if ln.strip()]
+
+    def calls(path):
+        return [c for c in lines(path) if c != ["--version"]]
+
+    def brain_env(tmp, name, fake):
+        """PATH holds only a fake brain (or nothing), HOME is empty, and no database path points at real data."""
+        bin_dir, home = os.path.join(tmp, name + "-bin"), os.path.join(tmp, name + "-home")
+        os.makedirs(bin_dir, exist_ok=True)
+        os.makedirs(home, exist_ok=True)
+        if fake is not None:
+            fakebrain.install_fake(bin_dir, fake)
+        return {"PATH": bin_dir, "HOME": home, "LEAN_BRAIN_DB": os.path.join(tmp, "brain.db"),
+                "LEAN_TESTS_DB": os.path.join(tmp, "tests.db")}
+
+    def run_hook(env, cmd, cwd, output):
+        event = json.dumps({"session_id": "s1", "cwd": cwd, "tool_input": {"command": cmd},
+                            "tool_response": {"stdout": output}})
+        done = subprocess.run([sys.executable, os.path.realpath(__file__)], input=event, env=env,
+                              capture_output=True, text=True)
+        return done.returncode, done.stdout, done.stderr
+
+    saved_env = dict(os.environ)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            cmd = "gh pr create --fill"
+            url = "https://github.com/o/r/pull/12"
+            log = os.path.join(tmp, "calls.log")
+            base = {k: v for k, v in saved_env.items() if k not in ("LEAN_CREATED_LOG",)}
+
+            os.environ.clear()
+            os.environ.update(base)
+            os.environ.update(brain_env(tmp, "none", None))
+            brainlink.reset()
+            check("no brain, a create saves nothing", record(cmd, tmp, out, "s1"), [])
+
+            fake = {"FAKE_BRAIN_LOG": log}
+            os.environ.update(brain_env(tmp, "fake", fake))
+            brainlink.reset()
+            check("record", record(cmd, tmp, out, "s1"), [url])
+            check("record calls created add", calls(log), [[
+                "created", "add", "--kind", "pr", "--forge", "github", "--url", url, "--number", "12",
+                "--repo", "o/r", "--session", "s1", "--cwd", tmp]])
+            check("record twice", record(cmd, tmp, out, "s1"), [url])
+            check("a failed create makes no brain call", record(cmd, tmp, "nope", "s1"), [])
+            check("a listing makes no brain call", record("gh pr list", tmp, out, "s1"), [])
+            check("only the two creates reached brain", len(calls(log)), 2)
+            check("a title is passed", record("gh issue create -t 'Fix it' -b x", tmp,
+                                             "https://github.com/o/r/issues/5\n", "s1") and calls(log)[-1][-8:-4],
+                  ["--repo", "o/r", "--title", "Fix it"])
+            brainlink.reset()
+
+            # the hook as a process: nothing extra on stdout or stderr, whatever brain does
+            nolog = os.path.join(tmp, "hook.log")
+            none_env = dict(base, **brain_env(tmp, "hook-none", None))
+            want = run_hook(none_env, cmd, tmp, out)
+            check("hook with no brain exits 0 and prints nothing", want, (0, "", ""))
+            hook_env = dict(base, **brain_env(tmp, "hook-fake", {"FAKE_BRAIN_LOG": nolog}))
+            check("hook with a brain prints the same", run_hook(hook_env, cmd, tmp, out), want)
+            check("hook recorded one created add", [c[:8] for c in calls(nolog)],
+                  [["created", "add", "--kind", "pr", "--forge", "github", "--url", url]])
+            check("a second identical run prints nothing extra", run_hook(hook_env, cmd, tmp, out), want)
+            check("the second run reached brain again", len(calls(nolog)), 2)
+            slow_env = dict(base, **brain_env(tmp, "hook-slow", {"FAKE_BRAIN_SLEEP": "5"}))
+            t0 = time.time()
+            check("hook with a slow brain prints the same", run_hook(slow_env, cmd, tmp, out), want)
+            check("hook with a slow brain returns within 4 s", time.time() - t0 < 4, True)
+            old_env = dict(base, **brain_env(tmp, "hook-old", {"FAKE_BRAIN_VERSION": "exit2"}))
+            check("hook with an old brain prints the same", run_hook(old_env, cmd, tmp, out), want)
+            off_env = dict(hook_env, LEAN_CREATED_LOG="off")
+            os.remove(nolog)
+            check("LEAN_CREATED_LOG=off makes no brain call", (run_hook(off_env, cmd, tmp, out), lines(nolog)),
+                  (want, []))
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
+        brainlink.reset()
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
 

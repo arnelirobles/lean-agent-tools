@@ -136,9 +136,9 @@ def message(env):
 def tools_note():
     """Where the scripts are: on PATH when session-env could put them there, else by absolute path."""
     if hookkit.tools_on_path():
-        return "lean-agent tools are on PATH. Run them by name, for example `brain list`."
+        return "lean-agent tools are on PATH. Run them by name, for example `test-phase queue list`."
     root = shlex.quote(hookkit.TOOLS)
-    return "Run lean-agent tools by full path, as %s/<name>, for example %s." % (root, hookkit.tool_path("brain") + " list")
+    return "Run lean-agent tools by full path, as %s/<name>, for example %s." % (root, hookkit.tool_path("test-phase") + " queue list")
 
 
 def main():
@@ -216,18 +216,18 @@ def self_test():
         os.environ.pop("CLAUDE_ENV_FILE", None)
         os.environ["PATH"] = "/usr/bin"
         note = tools_note()
-        if "/tools/<name>" not in note or "full path" not in note or not os.path.isfile(hookkit.TOOLS + "/brain"):
+        if "/tools/<name>" not in note or "full path" not in note or not os.path.isfile(hookkit.TOOLS + "/test-phase"):
             print(f"FAIL tools note should name a real tools folder: {note}")
             failures += 1
         os.environ["CLAUDE_ENV_FILE"] = "/nonexistent-lean-dir/env"
         hookkit._state.event = {"hook_event_name": "SessionStart", "session_id": "m-1"}
         note = tools_note()
-        if "are on PATH" in note or "/tools/brain" not in note:
-            print(f"FAIL an env file session-env may not have written must not put bare brain on PATH: {note}")
+        if "are on PATH" in note or "/tools/test-phase" not in note:
+            print(f"FAIL an env file session-env may not have written must not put bare test-phase on PATH: {note}")
             failures += 1
         os.environ["PATH"] = "/usr/bin" + os.pathsep + hookkit.TOOLS
         note = tools_note()
-        if "are on PATH" not in note or "`brain list`" not in note or "/tools/" in note:
+        if "are on PATH" not in note or "`test-phase queue list`" not in note or "/tools/" in note:
             print(f"FAIL tools note should say the tools are on PATH: {note}")
             failures += 1
     finally:

@@ -6,6 +6,8 @@ and every git call has a short timeout. Standard library only, Python 3.9+.
 
   python3 lib/hookkit.py --self-test
 """
+import contextlib
+import io
 import json
 import os
 import re
@@ -637,17 +639,24 @@ def note(event_name, text, user=None):
     _keep_notice(text)
 
 
+def flag_args(name, value):
+    """Argv for one brain flag; a value that starts with a dash goes in the --name=value form."""
+    return [f"{name}={value}"] if str(value).startswith("-") else [name, str(value)]
+
+
 def _keep_notice(text):
-    """Keep the note as a notice in brain for the web page. Never raises and never waits more than about a second."""
+    """Keep the note as a notice in brain for the web page. Never raises and never waits more than about a second.
+    A missing, old, slow or failing brain leaves the hook's output as it was."""
     if not _RECORD or os.environ.get("LEAN_NOTICES") == "off":
         return
     try:
-        from brain import records, store
-        con = store.connect(timeout=1)
-        records.add_notice(con, _hook_name(), text,
-                           str(_state.event.get("session_id") or ""), str(_state.event.get("cwd") or ""))
-        con.close()
-    except (SystemExit, Exception):  # a locked or newer database must not change the hook's output
+        import brainlink
+        args = (["notice", "add"] + flag_args("--hook", _hook_name())
+                + flag_args("--session", str(_state.event.get("session_id") or ""))
+                + flag_args("--cwd", str(_state.event.get("cwd") or "")))
+        with contextlib.redirect_stderr(io.StringIO()):
+            brainlink.call(args, stdin=text, timeout=1)
+    except (SystemExit, Exception):
         pass
 
 
@@ -1857,11 +1866,11 @@ def self_test():
         os.environ["PATH"] = "/usr/bin"
         os.environ["HOME"] = home
         _state.event = {}
-        check("tool_path is absolute and exists", (os.path.isabs(tool_path("brain")), os.path.exists(TOOLS + "/brain")), (True, True))
+        check("tool_path is absolute and exists", (os.path.isabs(tool_path("test-phase")), os.path.exists(TOOLS + "/test-phase")), (True, True))
         os.environ["CLAUDE_ENV_FILE"] = os.path.join(home, "no-such-dir", "env")  # session-env cannot write it
         _state.event = {"hook_event_name": "SessionStart", "session_id": "m-1"}
         check("SessionStart with an unwritable env file and no marker gives the absolute path",
-              tool_path("brain"), shlex.quote(os.path.join(TOOLS, "brain")))
+              tool_path("test-phase"), shlex.quote(os.path.join(TOOLS, "test-phase")))
         _state.event = {"hook_event_name": "PreToolUse", "session_id": "m-1"}
         check("CLAUDE_ENV_FILE alone does not count outside SessionStart", tools_on_path(), False)
         os.environ.pop("CLAUDE_ENV_FILE")
@@ -1869,17 +1878,17 @@ def self_test():
         os.makedirs(os.path.dirname(marker))
         with open(marker, "w") as fh:
             fh.write(TOOLS)
-        check("the session's marker puts the tools on PATH", tool_path("brain"), "brain")
+        check("the session's marker puts the tools on PATH", tool_path("test-phase"), "test-phase")
         _state.event = {"hook_event_name": "PreToolUse", "session_id": "m-2"}
-        check("another session has no marker", tool_path("brain").startswith("/"), True)
+        check("another session has no marker", tool_path("test-phase").startswith("/"), True)
         with open(marker, "w") as fh:
             fh.write("/old/tools")
         _state.event = {"hook_event_name": "PreToolUse", "session_id": "m-1"}
         check("a marker for another folder does not count", tools_on_path(), False)
         _state.event = {}
         os.environ["PATH"] = "/usr/bin" + os.pathsep + TOOLS
-        check("tool_path is the bare name when PATH names the tools", tool_path("brain"), "brain")
-        check("tool_path with a base stays a path", tool_path("brain", "/a/tools"), "/a/tools/brain")
+        check("tool_path is the bare name when PATH names the tools", tool_path("test-phase"), "test-phase")
+        check("tool_path with a base stays a path", tool_path("test-phase", "/a/tools"), "/a/tools/test-phase")
     finally:
         _state.event = saved_event
         shutil.rmtree(home, True)
@@ -1888,74 +1897,103 @@ def self_test():
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-    check("tool_path quotes a path with a space", tool_path("brain", "/a b/tools"), "'/a b/tools/brain'")
-    check("tool_path leaves a plain path bare", tool_path("brain", "/a/tools"), "/a/tools/brain")
+    check("tool_path quotes a path with a space", tool_path("test-phase", "/a b/tools"), "'/a b/tools/test-phase'")
+    check("tool_path leaves a plain path bare", tool_path("test-phase", "/a/tools"), "/a/tools/test-phase")
 
-    import sqlite3
+    import subprocess
     import time
 
-    def notice_rows(path):
-        if not os.path.exists(path):
-            return None
-        con = sqlite3.connect(path)
-        try:
-            return [tuple(r) for r in con.execute("SELECT hook, text, session_id, cwd FROM notices")]
-        except sqlite3.Error:
-            return None
-        finally:
-            con.close()
+    import brainlink
+    from testq import fakebrain
 
+    def brain_env(tmp, name, fake):
+        """PATH holds only a fake brain (or nothing), HOME is empty, the brainlink cache is cleared."""
+        bin_dir, home = os.path.join(tmp, name + "-bin"), os.path.join(tmp, name + "-home")
+        os.makedirs(bin_dir, exist_ok=True)
+        os.makedirs(home, exist_ok=True)
+        if fake is not None:
+            fakebrain.install_fake(bin_dir, fake)
+        return {"PATH": bin_dir, "HOME": home}
+
+    def lines(path):
+        if not os.path.exists(path):
+            return []
+        with open(path) as fh:
+            return [json.loads(ln) for ln in fh if ln.strip()]
+
+    def calls(path):
+        return [c for c in lines(path) if c != ["--version"]]
+
+    def noted_both():
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            note("PreToolUse", "hello")
+        return out.getvalue(), err.getvalue()
+
+    env_before = dict(os.environ)
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            bdb = os.path.join(tmp, "brain.db")
-            os.environ["LEAN_BRAIN_DB"] = bdb
             os.environ.pop("LEAN_NOTICES", None)
+            log, stdin_log = os.path.join(tmp, "calls.log"), os.path.join(tmp, "stdin.log")
+            fake = {"FAKE_BRAIN_LOG": log, "FAKE_BRAIN_STDIN_LOG": stdin_log}
             with leanstats.temp_env(LEAN_DB=os.path.join(tmp, "lean.db"), LEAN_STATS=None):
                 _RECORD, _state.event = True, {"session_id": "s1", "cwd": "/w"}
-                check("note output with notices on", noted(), want_note)
-                check("note leaves one notice", notice_rows(bdb), [("hookkit.py", "hello", "s1", "/w")])
+                os.environ.update(brain_env(tmp, "none", None))
+                brainlink.reset()
+                want_both = noted_both()
+                check("note output with no brain", json.loads(want_both[0]), want_note)
+                check("note stderr with no brain", want_both[1], "")
+                os.environ.update(brain_env(tmp, "fake", fake))
+                brainlink.reset()
+                check("note output with a brain", noted_both(), want_both)
+                check("note calls notice add", calls(log),
+                      [["notice", "add", "--hook", "hookkit.py", "--session", "s1", "--cwd", "/w"]])
+                check("note sends its text on stdin", lines(stdin_log), ["hello"])
                 os.environ["LEAN_NOTICES"] = "off"
-                os.environ["LEAN_BRAIN_DB"] = off_db = os.path.join(tmp, "off.db")
-                noted()
-                check("LEAN_NOTICES=off records nothing", os.path.exists(off_db), False)
+                os.remove(log)
+                brainlink.reset()
+                noted_both()
+                check("LEAN_NOTICES=off makes no brain call", lines(log), [])
                 os.environ.pop("LEAN_NOTICES")
                 _RECORD = False
-                os.environ["LEAN_BRAIN_DB"] = quiet_db = os.path.join(tmp, "quiet-brain.db")
-                noted()
-                check("a self-test run keeps no notice", os.path.exists(quiet_db), False)
+                brainlink.reset()
+                noted_both()
+                check("a self-test run makes no brain call", lines(log), [])
                 _RECORD = True
-                locked = os.path.join(tmp, "locked.db")
-                os.environ["LEAN_BRAIN_DB"] = locked
-                from brain import store
-                store.connect().close()
-                holder = sqlite3.connect(locked, isolation_level=None)
-                holder.execute("BEGIN EXCLUSIVE")
+                os.environ.update(brain_env(tmp, "slow", dict(fake, FAKE_BRAIN_SLEEP="5")))
+                brainlink.reset()
                 t0 = time.time()
-                check("locked brain, same note output", noted(), want_note)
-                check("locked brain returns within 2 s", time.time() - t0 < 2, True)
-                holder.close()
-                check("locked brain kept nothing", notice_rows(locked), [])
+                slow_both = noted_both()
+                check("slow brain returns within 2 s", time.time() - t0 < 2, True)
+                check("slow brain, same stdout and stderr as no brain", slow_both, want_both)
+                os.environ.update(brain_env(tmp, "old", dict(fake, FAKE_BRAIN_VERSION="exit2")))
+                brainlink.reset()
+                check("old brain, same stdout and stderr as no brain", noted_both(), want_both)
 
-        # a child of a self-test, with no LEAN_BRAIN_DB given, lands in the scratch brain and not the real one
-        import subprocess
-        child_env = dict(os.environ)
-        child_env.pop("LEAN_BRAIN_DB", None)
-        child_env.pop("LEAN_NOTICES", None)
-        code = ("import os, sys; sys.path.insert(0, sys.argv[1]); import hookkit; hookkit._RECORD = True;"
-                " hookkit.note('PreToolUse', 'child'); db = os.environ['LEAN_BRAIN_DB']; import sqlite3;"
-                " print(db); print(sqlite3.connect(db).execute('SELECT hook, text FROM notices').fetchall())")
-        done = subprocess.run([sys.executable, "-c", code, os.path.dirname(os.path.realpath(__file__)), "--self-test"],
-                              env=child_env, capture_output=True, text=True)
-        lines = done.stdout.strip().splitlines()
-        child_db, child_rows = (lines[-2], lines[-1]) if len(lines) >= 2 else ("", "")
-        real_db = os.path.realpath(os.path.expanduser("~/.local/share/lean/brain.db"))
-        check("child gets a scratch brain", bool(child_db) and os.path.realpath(child_db) != real_db, True)
-        check("child kept its notice in the scratch brain", child_rows, "[('-c', 'child')]")
+        # a child with a dash in its name still reaches brain with a parseable command line
+        with tempfile.TemporaryDirectory() as tmp:
+            clog = os.path.join(tmp, "calls.log")
+            child_env = dict(env_before)
+            child_env.update(brain_env(tmp, "child", {"FAKE_BRAIN_LOG": clog}))
+            child_env.pop("LEAN_NOTICES", None)
+            code = ("import sys; sys.path.insert(0, sys.argv[1]); import hookkit; hookkit._RECORD = True;"
+                    " hookkit.note('PreToolUse', 'child')")
+            done = subprocess.run([sys.executable, "-c", code, os.path.dirname(os.path.realpath(__file__)), "--self-test"],
+                                  env=child_env, capture_output=True, text=True)
+            check("child note exits 0", done.returncode, 0)
+            check("child note reaches brain with --hook=-c", calls(clog),
+                  [["notice", "add", "--hook=-c", "--session", "", "--cwd", ""]])
+        os.environ.clear()
+        os.environ.update(env_before)
+        brainlink.reset()
         _switch_tests(check, scratch)
         _guard_tests(check, scratch)
         os.environ["LEAN_PROFILE"] = "strict"
     finally:
         _RECORD, _state.event = False, {}
+        os.environ.clear()
+        os.environ.update(env_before)
+        brainlink.reset()
         shutil.rmtree(scratch, ignore_errors=True)
         for key, val in (("LEAN_BRAIN_DB", saved_brain), ("LEAN_NOTICES", saved_notices)):
             if val is None:

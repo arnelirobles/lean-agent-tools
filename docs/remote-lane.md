@@ -71,7 +71,7 @@ The copy is the files `git ls-files` lists (tracked and untracked, not ignored) 
 
 ## Vitest jobs
 
-A job whose test path is a `package.json` (for example `brain queue add ~/app web/package.json`) runs Vitest, not `dotnet test`. In that folder it installs with the nearest lockfile (`pnpm install --frozen-lockfile`, through corepack when pnpm is not installed, or `npm ci` for a `package-lock.json`), then runs `vitest run --reporter=verbose` (`pnpm exec`, or `npx` for npm). The fast filter pieces are file filters, and a failed test file is rerun alone.
+A job whose test path is a `package.json` (for example `test-phase queue add ~/app web/package.json`) runs Vitest, not `dotnet test`. In that folder it installs with the nearest lockfile (`pnpm install --frozen-lockfile`, through corepack when pnpm is not installed, or `npm ci` for a `package-lock.json`), then runs `vitest run --reporter=verbose` (`pnpm exec`, or `npx` for npm). The fast filter pieces are file filters, and a failed test file is rerun alone.
 
 On a host it runs in `node_image`. The container sits on the job's bridge network, so it has outbound network for the install. pnpm's store and corepack's download are kept in `<workdir>/.node-cache`, which `cache_max_gb` also caps. The host needs no Node.
 
@@ -79,11 +79,11 @@ The lockfile is looked up from the package folder to the repo root, so a pnpm wo
 
 A run that proves nothing fails. An unfiltered Vitest, dotnet or Playwright run that exits 0 with no passed or failed test fails as `ran no tests` (a run that only skipped tests counts too). If the output has no test count at all, it fails with `no test count was found in the output`; Vitest, node:test and TAP counts are read. A failed job cancels the jobs queued after it. The Gradle check is the same rule and is unchanged.
 
-There is no Jest runner. A job whose `package.json` uses jest and not vitest fails with a `run-failed` item that says so and runs nothing. A test path that is not a dotnet project or solution, a `package.json`, a Playwright config or a Gradle settings file (or a folder holding one) is refused by `brain queue add`, and fails by name if it reaches the drainer. It is never handed to `dotnet`. Dotnet children run with `DOTNET_CLI_UI_LANGUAGE=en` and `VSLANG=1033`, so the counts are read from English output.
+There is no Jest runner. A job whose `package.json` uses jest and not vitest fails with a `run-failed` item that says so and runs nothing. A test path that is not a dotnet project or solution, a `package.json`, a Playwright config or a Gradle settings file (or a folder holding one) is refused by `test-phase queue add`, and fails by name if it reaches the drainer. It is never handed to `dotnet`. Dotnet children run with `DOTNET_CLI_UI_LANGUAGE=en` and `VSLANG=1033`, so the counts are read from English output.
 
 A job whose test path is a `playwright.config.ts` (or `.js`, `.mjs`, `.cjs`) runs Playwright from that folder: the same install, then `playwright test --reporter=list`. The fast filter pieces are file filters, and a failed test is named `file > title`, so a rerun is per spec file. The default `node_image` has no Playwright browsers, so on a host set `node_image` to an image that has them (for example `mcr.microsoft.com/playwright`) or run the job on the local lane.
 
-A job whose test path is a `settings.gradle.kts` or `settings.gradle` (or the folder holding one) is a Gradle job. It never runs on a remote lane: a Gradle build can read `~/.gradle/gradle.properties`, `~/.gradle/init.d`, `~/.m2/settings.xml` and signing keys, and the local lane is the only place that has been checked for that. The job is marked `platform=private`, so only the local lane takes it. `brain queue route ID --to remote` and `--to any` refuse it, with or without `--force`, `brain queue add --platform none` is refused, and a remote lane that still receives one hands it back (brain pins it local again). `run_script` refuses `kind=gradle`. `lean_remote` does not add Gradle files to its never-copy list, because a Gradle job never reaches the copy.
+A job whose test path is a `settings.gradle.kts` or `settings.gradle` (or the folder holding one) is a Gradle job. It never runs on a remote lane: a Gradle build can read `~/.gradle/gradle.properties`, `~/.gradle/init.d`, `~/.m2/settings.xml` and signing keys, and the local lane is the only place that has been checked for that. The job is marked `platform=private`, so only the local lane takes it. `test-phase queue route ID --to remote` and `--to any` refuse it, with or without `--force`, `test-phase queue add --platform none` is refused, and a remote lane that still receives one hands it back (test-phase pins it local again in tests.db). `run_script` refuses `kind=gradle`. `lean_remote` does not add Gradle files to its never-copy list, because a Gradle job never reaches the copy.
 
 Three things to know:
 
@@ -107,13 +107,13 @@ Each claim prunes: the newest `build_keep` folders of the repository stay (newes
 
 ## Which jobs go where
 
-A job whose test project targets `-maccatalyst`, `-ios` or `-macos` is marked `platform=apple` and runs on the local lane only. An npm job (a `package.json` or Playwright config) whose `.npmrc`, in its folder or any folder up to the repo root, names a registry other than registry.npmjs.org is marked `platform=private` and also runs on the local lane only: its login lives in `~/.npmrc` on this machine, and the copy to a remote host never sends secrets. A Gradle job is `platform=private` too (see above), and `platform=apple` when its `--args` name an iOS test task (a test task whose name contains `ios`, in any case; option values do not count). Everything else can run on any lane. `brain queue add --platform apple|auto|none` overrides the detection.
+A job whose test project targets `-maccatalyst`, `-ios` or `-macos` is marked `platform=apple` and runs on the local lane only. An npm job (a `package.json` or Playwright config) whose `.npmrc`, in its folder or any folder up to the repo root, names a registry other than registry.npmjs.org is marked `platform=private` and also runs on the local lane only: its login lives in `~/.npmrc` on this machine, and the copy to a remote host never sends secrets. A Gradle job is `platform=private` too (see above), and `platform=apple` when its `--args` name an iOS test task (a test task whose name contains `ios`, in any case; option values do not count). Everything else can run on any lane. `test-phase queue add --platform apple|auto|none` overrides the detection.
 
-To choose for a job already queued, use `brain queue route ID --to remote|local|any`. `remote` sends it to a remote lane only, so the local lane skips it even when idle. `local` pins it to this machine. `any` lets whichever lane is free take it. Jobs queued before the upgrade to schema 7 are all marked `platform=apple`, so route the ones you want on a remote host. Routing a job to `remote` whose project looks Apple-only prints a warning and still routes it. A job routed to `remote` with no remote lane up stays queued, and test-phase names it at the end of the drain.
+To choose for a job already queued, use `test-phase queue route ID --to remote|local|any`. `remote` sends it to a remote lane only, so the local lane skips it even when idle. `local` pins it to this machine. `any` lets whichever lane is free take it. Jobs copied from a brain.db older than schema 7 have no platform set, so any lane may take them; pin one that needs this machine with `test-phase queue route ID --to local`. Routing a job to `remote` whose project looks Apple-only prints a warning and still routes it. A job routed to `remote` with no remote lane up stays queued, and test-phase names it at the end of the drain.
 
 ## Lane problems
 
-If ssh, the copy or docker fails before the test command starts, the job goes back to queued (`brain queue requeue`), no failure is filed, and that lane rests for `TEST_PHASE_REST` seconds (default 600). The local lane, or another host, picks the job up. The rest ends early once no lane is working. If the connection drops during a class rerun, the unfinished classes are marked unverified and the lane rests.
+If ssh, the copy or docker fails before the test command starts, the job goes back to queued (`test-phase queue requeue`), no failure is filed, and that lane rests for `TEST_PHASE_REST` seconds (default 600). The local lane, or another host, picks the job up. The rest ends early once no lane is working. If the connection drops during a class rerun, the unfinished classes are marked unverified and the lane rests.
 
 ## Cleanup
 
@@ -121,12 +121,12 @@ Every container and network carries the label `lean.job=<id>`. A job removes its
 
 ## One drainer per host
 
-Run one `test-phase` per host list. The sweep assumes every running job it sees in brain is its own. Two drainers sharing a host would remove each other's work.
+Run one `test-phase` per host list. The sweep assumes every running job it sees in tests.db is its own. Two drainers sharing a host would remove each other's work.
 
 ## Reading the output
 
-`brain queue list` shows `on=<host>` for a running remote job and `platform=apple` or `platform=remote` for routed jobs. Run rows carry the host. The summary table has a host column only when more than one lane exists.
+`test-phase queue list` shows `on=<host>` for a running remote job and `platform=apple` or `platform=remote` for routed jobs. Run rows carry the host. The summary table has a host column only when more than one lane exists.
 
 ## Rollout
 
-The first new `brain` moves the database to schema 7 (`jobs.platform`, `jobs.host`, `runs.host`). Older brains then refuse the database. Stop the drainer, then replace every copy of `brain` and `test-phase` in one step, then start the drainer.
+`tests.db` has its own schema, currently 1, and a test-phase that finds a newer one stops with a message. When you update, stop the drainer, replace every copy of `test-phase` in one step, then start the drainer.

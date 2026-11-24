@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Tie brain items to the Claude session that filed them, so an answer can go back to that session.
+"""Give the session's tools its session id and folder.
 
-SessionStart: writes LEAN_SESSION_ID and LEAN_SESSION_CWD to $CLAUDE_ENV_FILE, so `brain add` in this
-session stores them, and records the session as open in brain. SessionEnd: records it as ended, and
-starts `lean-stats collect --transcript` for that session in the background, so the numbers collect
-themselves. It also appends the tools folder to PATH there, once. The extension resumes only an ended session, so it never starts a second copy of a live one.
-UserPromptSubmit: hands the session the answers to its questions that it has not had yet.
-Never fails the session. LEAN_SESSION_ENV=off turns off the brain parts, not the PATH line; LEAN_STATS=off stops the collect.
+SessionStart: writes LEAN_SESSION_ID and LEAN_SESSION_CWD to $CLAUDE_ENV_FILE, so the queue knows the
+session, and appends the tools folder to PATH there, once. SessionEnd: starts `lean-stats collect
+--transcript` for that session in the background, so the numbers collect themselves. The brain plugin
+writes its own copies of the session lines and its own PATH line; each hook replaces only its own.
+Never fails the session. LEAN_SESSION_ENV=off turns off the session lines, not the PATH line; LEAN_STATS=off stops the collect.
 
   session-env.py --self-test
 """
@@ -25,7 +24,6 @@ HOOK = {
     "events": [
         {"event": "SessionStart", "group": 2, "order": 0},
         {"event": "SessionEnd", "group": 0, "order": 0},
-        {"event": "UserPromptSubmit", "group": 0, "order": 0},
     ],
     "timeout": 10,
     "mode": "process",
@@ -34,16 +32,7 @@ HOOK = {
     "default": {"strict": "note", "standard": "note"},
 }
 
-BRAIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools", "brain")
 LEAN_STATS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools", "lean-stats")
-
-
-def brain(*args):
-    try:
-        r = subprocess.run([sys.executable, BRAIN, *args], capture_output=True, text=True, timeout=5)
-    except (subprocess.SubprocessError, OSError):  # a locked database makes brain wait past the timeout
-        return ""
-    return r.stdout.strip() if r.returncode == 0 else ""
 
 
 PATH_LINE = re.compile(r'export PATH=(?:"\$PATH":|"\$\{PATH:\+\$PATH:\}")(.+)')
@@ -125,7 +114,7 @@ def write_env(env_file, sid=None, cwd="", session=True):
     session = bool(sid and session)
     if session:
         new.append(f"export LEAN_SESSION_ID={shlex.quote(sid)}")
-        if cwd:
+        if cwd and not any(c in cwd for c in "\r\n\x00"):  # a line break would split the line on the next write
             new.append(f"export LEAN_SESSION_CWD={shlex.quote(cwd)}")
     new.append(path_line())
     existed = os.path.exists(env_file)
@@ -190,7 +179,6 @@ def main():
     event = hookkit.read_event()
     name = event.get("hook_event_name")
     sid, cwd = hookkit.session_id(event.get("session_id")), str(event.get("cwd") or "")
-    sid_ok = sid is not None
     off = (os.environ.get("LEAN_SESSION_ENV") or "").lower() == "off"
     if name == "SessionEnd":
         proc = collect_session(event.get("transcript_path"))
@@ -201,17 +189,6 @@ def main():
             os.unlink(marker)
     if name == "SessionStart" and os.environ.get("CLAUDE_ENV_FILE"):
         write_env(os.environ["CLAUDE_ENV_FILE"], sid, cwd, session=not off)
-    if off or not sid_ok:
-        return 0
-    if name == "SessionStart":
-        brain("session", "start", sid, "--cwd", cwd)
-    elif name == "SessionEnd":
-        brain("session", "end", sid)
-    elif name == "UserPromptSubmit":
-        answers = brain("answers", "--session", sid)
-        if answers:
-            hookkit.note("UserPromptSubmit", "Answers to questions you filed in brain (already closed as answered):\n"
-                         + answers)
     return 0
 
 
@@ -236,9 +213,6 @@ def self_test():
             r = subprocess.run([sys.executable, me], input=event, env=env, capture_output=True, text=True)
             return r.returncode, r.stdout, r.stderr
 
-        def brain_out(*args):
-            return subprocess.run([sys.executable, BRAIN, *args], env=env, capture_output=True, text=True).stdout.strip()
-
         rc, out, err = hook("SessionStart")
         if rc != 0 or out:
             fails.append(f"start must be quiet: {rc} {out!r} {err!r}")
@@ -256,10 +230,10 @@ def self_test():
         marker = os.path.join(home, ".local", "share", "lean", "tools-on-path", "abc-123")
         if not os.path.exists(marker) or open(marker).read() != hookkit.TOOLS:
             fails.append("start must leave a marker naming the tools folder for the hooks that never see the env file")
-        shown = subprocess.run(["bash", "-c", f'PATH=/usr/bin:/bin; . {shlex.quote(env_file)}; command -v brain'],
+        shown = subprocess.run(["bash", "-c", f'PATH=/usr/bin:/bin; . {shlex.quote(env_file)}; command -v test-phase'],
                                capture_output=True, text=True).stdout.strip()
-        if shown != os.path.join(hookkit.TOOLS, "brain"):
-            fails.append(f"a shell sourcing the env file must find brain: {shown!r}")
+        if shown != os.path.join(hookkit.TOOLS, "test-phase"):
+            fails.append(f"a shell sourcing the env file must find test-phase: {shown!r}")
         hook("SessionStart")
         hook("SessionStart", raw=json_str({"hook_event_name": "SessionStart", "session_id": "abc-123", "cwd": cwd,
                                            "source": "compact"}))
@@ -282,18 +256,18 @@ def self_test():
         cache = os.path.join(d, "plugins", "cache", "mkt", "lean-agent-tools")
         old_tools = os.path.join(cache, "1.16.0", "tools")
         os.makedirs(old_tools)
-        with open(os.path.join(old_tools, "brain"), "w") as fh:
+        with open(os.path.join(old_tools, "test-phase"), "w") as fh:
             fh.write("#!/bin/sh\necho old\n")
-        os.chmod(os.path.join(old_tools, "brain"), 0o755)
+        os.chmod(os.path.join(old_tools, "test-phase"), 0o755)
         upgraded = os.path.join(d, "upgraded-env")
         with open(upgraded, "w") as fh:
             fh.write(f'export LEAN_SESSION_ID=up-1\nexport PATH="$PATH":{shlex.quote(old_tools)}\n')
         env["CLAUDE_ENV_FILE"] = upgraded
         hook("SessionStart", sid="up-1")
-        wins = subprocess.run(["bash", "-c", f'PATH=/usr/bin:/bin; . {shlex.quote(upgraded)}; command -v brain'],
+        wins = subprocess.run(["bash", "-c", f'PATH=/usr/bin:/bin; . {shlex.quote(upgraded)}; command -v test-phase'],
                               capture_output=True, text=True).stdout.strip()
-        if wins != os.path.join(hookkit.TOOLS, "brain"):
-            fails.append(f"after an upgrade bare brain must run the current version, not {wins!r}: "
+        if wins != os.path.join(hookkit.TOOLS, "test-phase"):
+            fails.append(f"after an upgrade bare test-phase must run the current version, not {wins!r}: "
                          f"{open(upgraded).read()!r}")
         others = [os.path.join(d, "repos", "lean-agent", "tools"), os.path.join(d, "lean-agent", "foo", "tools"),
                   os.path.join(d, "dev", "tools"), os.path.join(d, "plugins", "cache", "lean-agent", "tools")]
@@ -349,7 +323,7 @@ def self_test():
             env["CLAUDE_ENV_FILE"] = bad
             sid = "ro-1" if label == "a read-only file" else "nodir-1"
             rc, out, err = hook("SessionStart", sid=sid)
-            if rc != 0 or err or brain_out("session", "status", sid) != f"open {cwd}":
+            if rc != 0 or err:
                 fails.append(f"{label} as the env file must not stop the session start: {rc} {err!r}")
             if os.path.exists(os.path.join(home, ".local", "share", "lean", "tools-on-path", sid)):
                 fails.append(f"{label} as the env file must leave no marker, the tools are not on PATH")
@@ -384,21 +358,61 @@ def self_test():
         text = open(loose).read()
         if text != f'export PATH=/other:"$PATH"\n{want}\n':
             fails.append(f"a file with no final newline must get one line of ours on its own line: {text!r}")
-        if brain_out("session", "status", "abc-123") != f"open {cwd}":
-            fails.append("start must record the session as open")
-        hook("SessionEnd")
-        if brain_out("session", "status", "abc-123") != f"ended {cwd}":
-            fails.append("end must record the session as ended")
+        if hook("UserPromptSubmit")[1:] != ("", ""):
+            fails.append("a prompt must get nothing from session-env")
 
-        subprocess.run([sys.executable, BRAIN, "add", "--project", "p", "--kind", "question", "--ref", "q",
-                        "--title", "which port", "--session", "abc-123"], env=env, capture_output=True)
-        subprocess.run([sys.executable, BRAIN, "close", "1", "--resolution", "answered", "--note", "8080"],
-                       env=env, capture_output=True)
-        rc, out, _ = hook("UserPromptSubmit")
-        if rc != 0 or "#1 which port: 8080" not in out or "UserPromptSubmit" not in out:
-            fails.append(f"a prompt must carry the new answer: {rc} {out!r}")
-        if hook("UserPromptSubmit")[1]:
-            fails.append("an answer is handed over once")
+        # brain's hook shares the file: seed it with brain's lines (the brain plugin's own PATH folder), check
+        # both orders and a resume. The other writer's semantics are applied here, its hook file is not run.
+        brain_tools = os.path.join(d, "plugins", "cache", "m", "brain", "1.0.0", "tools")
+        brain_path = f'export PATH="${{PATH:+$PATH:}}"{shlex.quote(brain_tools)}'
+        brain_lines = ["export LEAN_SESSION_ID=abc-123", f"export LEAN_SESSION_CWD={shlex.quote(cwd)}", brain_path]
+
+        def brain_writer(path):
+            with open(path) as fh:
+                lines = fh.read().splitlines()
+            kept = [ln for ln in lines if not ln.startswith(("export LEAN_SESSION_ID=", "export LEAN_SESSION_CWD="))
+                    and ln != brain_path]
+            with open(path, "w") as fh:
+                fh.write("".join(ln + "\n" for ln in kept + brain_lines))
+
+        def both_once(path):
+            lines = open(path).read().splitlines()
+            return (lines.count("export LEAN_SESSION_ID=abc-123") == 1 and lines.count(brain_lines[1]) == 1
+                    and lines.count(want) == 1 and lines.count(brain_path) == 1
+                    and len([ln for ln in lines if ln.startswith("export PATH=")]) == 2), lines
+
+        order_a = os.path.join(d, "order-a-env")
+        with open(order_a, "w") as fh:
+            fh.write("".join(ln + "\n" for ln in brain_lines))
+        env["CLAUDE_ENV_FILE"] = order_a
+        hook("SessionStart")
+        ok, lines = both_once(order_a)
+        if not ok or lines[-1] != want:
+            fails.append(f"after brain's lines, each session line once and one PATH line per folder: {lines!r}")
+        hook("SessionStart")
+        ok, lines = both_once(order_a)
+        if not ok:
+            fails.append(f"a resume must change nothing: {lines!r}")
+        order_b = os.path.join(d, "order-b-env")
+        env["CLAUDE_ENV_FILE"] = order_b
+        hook("SessionStart")
+        brain_writer(order_b)
+        hook("SessionStart")
+        brain_writer(order_b)
+        ok, lines = both_once(order_b)
+        if not ok:
+            fails.append(f"our lines, then brain's, then ours again as a resume: {lines!r}")
+        env["CLAUDE_ENV_FILE"] = env_file
+        nl_file = os.path.join(d, "newline-env")
+        env["CLAUDE_ENV_FILE"] = nl_file
+        bad_cwd = "/a\n' ; touch /tmp/x ; '"
+        for _ in range(2):
+            hook("SessionStart", raw=json_str({"hook_event_name": "SessionStart", "session_id": "nl-1", "cwd": bad_cwd}))
+        nl_lines = open(nl_file).read().splitlines()
+        if [ln for ln in nl_lines if "LEAN_SESSION_CWD" in ln] or \
+                [ln for ln in nl_lines if ln != want and not ln.startswith("export LEAN_SESSION_ID=")]:
+            fails.append(f"a cwd with a newline must write no cwd line and leave only expected lines: {nl_lines!r}")
+        env["CLAUDE_ENV_FILE"] = env_file
 
         before = open(env_file).read()
         if hook("SessionStart", sid="x; rm -rf ~")[0] != 0 or open(env_file).read() != before:

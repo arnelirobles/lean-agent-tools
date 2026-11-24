@@ -1,0 +1,565 @@
+#!/usr/bin/env python3
+"""An MCP server over stdio that lets a Claude session use the test queue.
+
+Newline-delimited JSON-RPC 2.0, Python 3 standard library only. Every tool runs the `test-phase` script that
+sits next to this one as a subprocess with an argument list (never a shell), so the rules stay in one place.
+A nonzero exit becomes a tool result with isError true and the stderr text.
+
+Tools: queue_list, queue_add, queue_cancel, queue_bump, queue_route. `queue next` and `queue finish` are not
+exposed: only the drainer (tools/test-phase) claims and finishes jobs.
+
+queue_list defaults to queued and running jobs; a cut says how many more exist. A queue_add returns the job
+id at once and never waits.
+
+TESTS_MCP_ARGV_LOG=FILE appends the argv of every test-phase call to FILE as one JSON line (used by the
+self-test). Logs go to stderr only.
+
+  tests-mcp --self-test
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+TEST_PHASE = os.path.join(HERE, "test-phase")
+DEFAULT_PROTOCOL = "2025-06-18"
+CALL_TIMEOUT = 60
+GIT_TIMEOUT = 10
+
+
+def plugin_version():
+    try:
+        with open(os.path.join(HERE, "..", ".claude-plugin", "plugin.json")) as f:
+            return str(json.load(f)["version"])
+    except (OSError, ValueError, KeyError):
+        return "0"
+
+
+def log(*a):
+    print("tests-mcp:", *a, file=sys.stderr, flush=True)
+
+
+def S(desc):
+    return {"type": "string", "description": desc}
+
+
+def I(desc):
+    return {"type": "integer", "description": desc}
+
+
+def schema(props, required=()):
+    d = {"type": "object", "properties": props, "additionalProperties": False}
+    if required:
+        d["required"] = list(required)
+    return d
+
+
+class Bad(Exception):
+    pass
+
+
+def need_int(a, k):
+    v = a.get(k)
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise Bad(f"{k} must be an integer")
+    return str(v)
+
+
+def need_str(a, k):
+    v = a.get(k)
+    if not isinstance(v, str) or not v:
+        raise Bad(f"{k} is required and must be a non-empty string")
+    # A value that starts with a dash would be read as an option, not as the value.
+    if v.startswith("-"):
+        raise Bad(f"{k} must not start with -")
+    if "\0" in v:
+        raise Bad(f"{k} must not contain a null byte")
+    return v
+
+
+def opt(a, args, key, flag=None, kind=str):
+    """Append --flag=value when key is present."""
+    v = a.get(key)
+    if v is None or v == "":
+        return
+    if kind is int:
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise Bad(f"{key} must be an integer")
+        v = str(v)
+    elif not isinstance(v, str):
+        raise Bad(f"{key} must be a string")
+    if "\0" in v:
+        raise Bad(f"{key} must not contain a null byte")
+    # --flag=value keeps a value such as "-1 offset" a value.
+    args.append((flag or "--" + key.replace("_", "-")) + "=" + v)
+
+
+DEFAULT_LIMIT = 50
+MAX_LIMIT = 1000
+MAX_BYTES = 8000
+
+
+def limit_of(a):
+    v = a.get("limit")
+    if v is None:
+        return DEFAULT_LIMIT
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        raise Bad("limit must be a positive integer")
+    return min(v, MAX_LIMIT)
+
+
+def cut(lines, limit, what, max_bytes=MAX_BYTES):
+    """The first lines that fit the line limit and the byte cap, then a line that says how many were left out."""
+    kept, size = [], 0
+    for ln in lines:
+        size += len(ln.encode()) + 1
+        if len(kept) >= limit or size > max_bytes:
+            break
+        kept.append(ln)
+    if len(kept) == len(lines):
+        return "\n".join(lines)
+    return "\n".join(kept + [f"... {len(lines) - len(kept)} more {what}; narrow the filters or pass a bigger limit"])
+
+
+def after_queue_list(a, text):
+    status = a.get("status")
+    if not status:
+        # Running jobs, then queued ones in the order the drainer takes them, so a cut drops the last to run.
+        extra = ["--cycle=" + a["cycle"]] if a.get("cycle") else []
+        rc, out, err = run_test_phase(["queue", "list", "--status=queued", *extra], None)
+        if rc != 0:
+            return result(err.strip() or out.strip() or f"test-phase exited {rc}", True)
+        lines = text.splitlines() + out.splitlines()
+    elif status in ("queued", "running"):
+        lines = text.splitlines()
+    else:
+        lines = list(reversed(text.splitlines()))
+    return cut(lines, limit_of(a), "jobs") or (f"no {status} jobs" if status else "no queued or running jobs")
+
+
+def t_queue_list(a):
+    limit_of(a)
+    args = ["queue", "list"]
+    if not a.get("status"):
+        args.append("--status=running")  # after_queue_list adds the queued jobs in drainer order
+    opt(a, args, "status")
+    opt(a, args, "cycle")
+    return args, None
+
+
+CLASS = re.compile(r"[A-Za-z0-9_.*~`+<>]+")
+
+
+def t_queue_add(a):
+    args = ["queue", "add", need_str(a, "repo_dir"), need_str(a, "test_project"), "--by", "mcp", "--infer-session"]
+    # test-phase splits a filter on | and hands each piece to dotnet, so check each piece, not the whole.
+    f = a.get("filter")
+    if f not in (None, "") and not (isinstance(f, str) and all(CLASS.fullmatch(p.strip()) for p in f.split("|"))):
+        raise Bad("filter must be class names joined by |")
+    if a.get("tier") not in (None, "", "fast", "full"):
+        raise Bad("tier must be fast or full")
+    for k in ("filter", "tier", "cycle", "again"):
+        opt(a, args, k)
+    opt(a, args, "after", kind=int)
+    # No extra dotnet arguments here: they run on the drainer's machine, so they stay a shell-only choice.
+    # Only the top of a git work tree: a queued job builds and runs that folder's code, and a remote
+    # lane copies its files, so a scratch folder somewhere is not a place to queue from.
+    try:
+        top = subprocess.run(["git", "-C", args[2], "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+                             timeout=GIT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise Bad(f"git rev-parse failed: timed out after {GIT_TIMEOUT} seconds")
+    except (OSError, ValueError) as e:
+        raise Bad(f"git rev-parse failed: {e}")
+    if not os.path.isdir(args[2]) or top.returncode != 0 or \
+            os.path.realpath(top.stdout.strip()) != os.path.realpath(args[2]):
+        raise Bad("repo_dir must be the top folder of a git work tree")
+    return args, None
+
+
+def t_queue_cancel(a):
+    return ["queue", "cancel", need_int(a, "id")], None
+
+
+def t_queue_bump(a):
+    return ["queue", "bump", need_int(a, "id")], None
+
+
+def t_queue_route(a):
+    to = need_str(a, "to")
+    if to not in ("remote", "local", "any"):
+        raise Bad("to must be remote, local or any")
+    return ["queue", "route", need_int(a, "id"), "--to=" + to], None
+
+
+TOOLS = [
+    ("queue_list", "List test queue jobs: queued and running unless status says otherwise, newest first, "
+     "50 at most.", t_queue_list, schema({
+        "limit": I("most lines to return, default 50"),
+        "status": S("queued, running, done, failed or cancelled"), "cycle": S("cycle name")})),
+    ("queue_add", "Queue a test job. Returns the job id at once, the id of the identical queued job when there is one; do not wait for it.", t_queue_add, schema({
+        "repo_dir": S("repository folder"), "test_project": S("test project path"), "filter": S("test filter"),
+        "tier": S("fast or full"), "after": I("job id this one waits for"), "cycle": S("cycle name"),
+        "again": S("reason to run a full job again for a commit that already has one, or from a dirty tree")},
+        ["repo_dir", "test_project"])),
+    ("queue_cancel", "Cancel a queued job and the jobs waiting on it.", t_queue_cancel,
+     schema({"id": I("job id")}, ["id"])),
+    ("queue_bump", "Move a queued job, and the jobs chained after it, ahead of the rest.", t_queue_bump,
+     schema({"id": I("job id")}, ["id"])),
+    ("queue_route", "Choose which lanes may run a queued job: remote (only a remote host such as the VM), "
+     "local (only this machine) or any.", t_queue_route,
+     schema({"id": I("job id"), "to": S("remote, local or any")}, ["id", "to"])),
+]
+BY_NAME = {n: f for n, _, f, _ in TOOLS}
+AFTER = {"queue_list": after_queue_list}
+
+
+def run_test_phase(args, stdin):
+    argv = [sys.executable, TEST_PHASE, *args]
+    path = os.environ.get("TESTS_MCP_ARGV_LOG")
+    if path:
+        with open(path, "a") as f:
+            f.write(json.dumps(argv) + "\n")
+    extra = {"stdin": subprocess.DEVNULL} if stdin is None else {"input": stdin}
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=CALL_TIMEOUT, **extra)
+    return r.returncode, r.stdout, r.stderr
+
+
+def result(text, err=False):
+    return {"content": [{"type": "text", "text": text}], "isError": err}
+
+
+def call_tool(name, a):
+    fn = BY_NAME.get(name)
+    if fn is None:
+        return None
+    if not isinstance(a, dict):
+        return result("arguments must be an object", True)
+    try:
+        args, stdin = fn(a)
+    except Bad as e:
+        return result(str(e), True)
+    try:
+        rc, out, err = run_test_phase(args, stdin)
+    except subprocess.TimeoutExpired:
+        return result(f"test-phase timed out after {CALL_TIMEOUT} seconds", True)
+    except (OSError, ValueError) as e:
+        return result(f"could not run test-phase: {e}", True)
+    if rc != 0:
+        return result((err.strip() or out.strip() or f"test-phase exited {rc}"), True)
+    if name in AFTER:
+        try:
+            out = AFTER[name](a, out)
+        except subprocess.TimeoutExpired:
+            return result(f"test-phase timed out after {CALL_TIMEOUT} seconds", True)
+        except (OSError, ValueError) as e:
+            return result(f"could not run test-phase: {e}", True)
+        if isinstance(out, dict):  # the follow-up call failed: its error result
+            return out
+    return result(out.strip() or "ok")
+
+
+def handle(msg):
+    """Return a response dict, or None for a notification."""
+    if not isinstance(msg, dict):
+        return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request"}}
+    method = msg.get("method")
+    mid = msg.get("id")
+    has_id = "id" in msg
+    params = msg.get("params") or {}
+
+    def ok(res):
+        return {"jsonrpc": "2.0", "id": mid, "result": res}
+
+    def fail(code, text):
+        return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": text}}
+
+    if not has_id:  # notification, never answered
+        return None
+    if method == "initialize":
+        return ok({"protocolVersion": params.get("protocolVersion") or DEFAULT_PROTOCOL,
+                   "capabilities": {"tools": {}}, "serverInfo": {"name": "tests", "version": plugin_version()}})
+    if method == "ping":
+        return ok({})
+    if method == "tools/list":
+        return ok({"tools": [{"name": n, "description": d, "inputSchema": s} for n, d, _, s in TOOLS]})
+    if method == "tools/call":
+        res = call_tool(params.get("name"), params.get("arguments") or {})
+        if res is None:
+            return fail(-32602, f"unknown tool: {params.get('name')}")
+        return ok(res)
+    return fail(-32601, f"method not found: {method}")
+
+
+def serve():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            resp = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}
+        else:
+            try:
+                resp = handle(msg)
+            except Exception as e:  # keep the server alive
+                log("internal error:", repr(e))
+                resp = {"jsonrpc": "2.0", "id": msg.get("id") if isinstance(msg, dict) else None,
+                        "error": {"code": -32603, "message": "internal error"}}
+        if resp is not None:
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+
+
+def self_test():
+    import shutil
+    fails = []
+    me = os.path.realpath(__file__)
+    sys.path.insert(0, os.path.join(HERE, "..", "lib"))
+    from testq import fakebrain
+    with tempfile.TemporaryDirectory() as d:
+        fake_bin = os.path.join(d, "bin")
+        fakebrain.install_fake(fake_bin, {})
+        os.symlink(shutil.which("git"), os.path.join(fake_bin, "git"))
+        home = os.path.join(d, "home")
+        os.mkdir(home)
+        argv_log = os.path.join(d, "argv.log")
+        env = dict(os.environ, LEAN_BRAIN_DB=os.path.join(d, "brain.db"), LEAN_TESTS_DB=os.path.join(d, "tests.db"),
+                   LEAN_TEST_PHASE_DIR=os.path.join(d, "runs"), TESTS_MCP_ARGV_LOG=argv_log, PATH=fake_bin,
+                   HOME=home, FAKE_BRAIN_STATE=os.path.join(d, "fake.json"), FAKE_BRAIN_LOG=os.path.join(d, "fake.log"))
+        env.pop("LEAN_SESSION_ID", None)
+        env.pop("LEAN_SESSION_CWD", None)
+        p = subprocess.Popen([sys.executable, me], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, env=env)
+        n = [0]
+
+        def rpc(method, params=None):
+            n[0] += 1
+            p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": n[0], "method": method, "params": params or {}}) + "\n")
+            p.stdin.flush()
+            r = json.loads(p.stdout.readline())
+            if r.get("id") != n[0]:
+                fails.append(f"{method}: id mismatch {r}")
+            return r
+
+        def call(name, **a):
+            r = rpc("tools/call", {"name": name, "arguments": a})
+            res = r.get("result", {})
+            text = "".join(c.get("text", "") for c in res.get("content", []))
+            return bool(res.get("isError")), text
+
+        try:
+            r = rpc("initialize", {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "t"}})
+            res = r.get("result", {})
+            if res.get("protocolVersion") != "2025-03-26" or res.get("serverInfo", {}).get("name") != "tests" \
+                    or "tools" not in res.get("capabilities", {}):
+                fails.append(f"initialize: {r}")
+            with open(os.path.join(HERE, "..", ".claude-plugin", "plugin.json")) as pj:
+                plugin_version = json.load(pj)["version"]
+            if res.get("serverInfo", {}).get("version") != plugin_version:
+                fails.append(f"serverInfo version must be the plugin's {plugin_version}: {res.get('serverInfo')}")
+            p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+            p.stdin.flush()
+            if rpc("ping").get("result") != {}:
+                fails.append("ping must return {}")
+            names = {t["name"] for t in rpc("tools/list").get("result", {}).get("tools", [])}
+            want = {"queue_add", "queue_list", "queue_bump", "queue_cancel", "queue_route"}
+            if names != want:
+                fails.append(f"tools/list: missing {sorted(want - names)} extra {sorted(names - want)}")
+            for gone in ("queue_next", "brain_queue_add", "queue_finish"):
+                if "error" not in rpc("tools/call", {"name": gone, "arguments": {}}):
+                    fails.append(f"{gone} must not be exposed")
+            err, text = call("queue_add", test_project="tests/A.csproj")
+            if not err:
+                fails.append(f"queue_add without repo_dir must be isError: {text!r}")
+            repo = os.path.join(d, "repo")
+            os.makedirs(os.path.join(repo, "sub"))
+            subprocess.run(["git", "init", "-q", repo], check=True)
+            for not_top in (d, os.path.join(repo, "sub")):
+                err, text = call("queue_add", repo_dir=not_top, test_project="tests/A.csproj")
+                if not err:
+                    fails.append(f"queue_add must refuse a folder that is not a git top folder: {not_top}")
+            os.makedirs(os.path.join(repo, "tests"))
+            with open(os.path.join(repo, "tests", "A.csproj"), "w") as f:
+                f.write("<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>")
+            err, text = call("queue_add", repo_dir=repo, test_project="tests/A.csproj", filter="X", tier="fast")
+            if err or text != "1":
+                fails.append(f"queue_add: {err} {text!r}")
+            err2, text2 = call("queue_add", repo_dir=repo, test_project="tests/A.csproj", filter="X", tier="fast")
+            if err2 or text2 != text:
+                fails.append(f"queue_add must return the id of an identical queued job: {text!r} {text2!r}")
+            for bad in ({"repo_dir": repo, "test_project": "--help"},
+                        {"repo_dir": repo, "test_project": "t", "filter": "-x"},
+                        {"repo_dir": repo, "test_project": "t", "filter": "A| --help"},
+                        {"repo_dir": repo, "test_project": "t", "tier": "slow"},
+                        {"repo_dir": os.path.join(repo, "nope"), "test_project": "t"}):
+                err, text = call("queue_add", **bad)
+                if not err:
+                    fails.append(f"queue_add must refuse {bad}: {text!r}")
+            for nul in ({"repo_dir": "a\0b", "test_project": "t"}, {"repo_dir": repo, "test_project": "t\0x"},
+                        {"repo_dir": repo, "test_project": "t", "again": "a\0b"}):
+                err, text = call("queue_add", **nul)
+                if not err or not text or "internal error" in text:
+                    fails.append(f"C5: a null byte in {nul} must be a readable isError, not an internal error: {err} {text!r}")
+            err, text = call("queue_route", id=1, to="remote")
+            if err or "platform=remote" not in text:
+                fails.append(f"queue_route must send a queued job to a remote lane: {err} {text!r}")
+            call("queue_add", repo_dir=repo, test_project="tests/Mac.csproj")  # unreadable, so queued as apple
+            err, text = call("queue_route", id=2, to="remote")
+            if not err or "--force" not in text:
+                fails.append(f"queue_route must refuse sending an apple job to a remote lane: {err} {text!r}")
+            for bad in ({"id": 1, "to": "vm"}, {"id": 1, "to": "--help"}, {"id": 1}):
+                err, text = call("queue_route", **bad)
+                if not err:
+                    fails.append(f"queue_route must refuse {bad}: {text!r}")
+            err, text = call("queue_add", repo_dir=repo, test_project="tests/A.csproj", again="a reason")
+            if err or "--again=a reason" not in open(argv_log).read():
+                fails.append(f"queue_add must pass again through: {err} {text!r}")
+            err, text = call("queue_list")
+            if err or "tests/A.csproj" not in text:
+                fails.append(f"queue_list must show the job: {err} {text!r}")
+            err, text = call("queue_bump", id=2)
+            err2, text2 = call("queue_list", status="queued", limit=1)
+            if err or err2 or not text2.startswith("job #2 ") or "more jobs" not in text2:
+                fails.append(f"queue_bump must put the job first and a cut list must say so: {text!r} {text2!r}")
+            err, text = call("queue_list", limit=0)
+            if not err:
+                fails.append("a limit under 1 must be refused")
+            err, text = call("queue_cancel", id=2)
+            err2, text2 = call("queue_list", status="cancelled")
+            if err or err2 or "job #2" not in text2:
+                fails.append(f"queue_cancel must cancel the job: {text!r} {text2!r}")
+            err, text = call("queue_list", status="done")
+            if err or text != "no done jobs":
+                fails.append(f"an empty queue_list must name the status asked for: {err} {text!r}")
+            import sqlite3
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            tdb = sqlite3.connect(env["LEAN_TESTS_DB"])
+            for i in range(300):
+                tdb.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) "
+                            "VALUES ('big1', '/x', ?, 'done', ?)", ("t/Done%d.csproj" % i, stamp))
+            tdb.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) "
+                        "VALUES ('big1', '/x', 't/Running.csproj', 'running', ?)", (stamp,))
+            tdb.commit()
+            tdb.close()
+            err, text = call("queue_list")
+            lines = text.splitlines()
+            if err or "Running.csproj" not in text or "Done" in text or "tests/A.csproj" not in text \
+                    or "Running.csproj" not in lines[0]:
+                fails.append(f"queue_list default must list running before queued and leave out done: {err} {text[:300]!r}")
+            err, text = call("queue_list", limit=None)
+            if err or "Running.csproj" not in text.splitlines()[0]:
+                fails.append(f"a null limit means no limit, and running jobs come first: {err} {text[:200]!r}")
+            err, text = call("queue_list", status="done")
+            if err or "Done299.csproj" not in text or len(text.splitlines()) != 51 \
+                    or "more jobs" not in text.splitlines()[-1]:
+                fails.append(f"queue_list status done must list done jobs, cut at 50: {err} {len(text.splitlines())}")
+            err, text = call("queue_cancel", id="one")
+            if not err:
+                fails.append("a non-integer id must be isError")
+            err, text = call("queue_cancel", id=99999)
+            if not err or not text:
+                fails.append(f"a bad id must be isError with text: {err} {text!r}")
+            if rpc("nope/nothing").get("error", {}).get("code") != -32601:
+                fails.append("unknown method must be -32601")
+        except Exception as e:
+            fails.append(f"exception: {e!r}")
+        finally:
+            try:
+                p.stdin.close()
+                p.wait(timeout=10)
+            except Exception:
+                p.kill()
+        # In-process, with a fake test-phase and git hidden: a failed second list or a missing git is a tool error.
+        try:
+            import importlib.machinery
+            import importlib.util
+            loader = importlib.machinery.SourceFileLoader("tests_mcp_under_test", me)
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            fake_tp = os.path.join(d, "fake-test-phase.py")
+            with open(fake_tp, "w") as f:
+                f.write("import os, sys, time\n"
+                        "if '--status=queued' in sys.argv:\n"
+                        "    if os.environ.get('FAKE_TP_QUEUED') == 'slow':\n"
+                        "        time.sleep(5)\n"
+                        "    sys.stderr.write('fake queued list broke\\n')\n"
+                        "    sys.exit(1)\n"
+                        "print('job #7 running')\n")
+            mod.TEST_PHASE = fake_tp
+            res = mod.call_tool("queue_list", {})
+            if not res["isError"] or "fake queued list broke" not in res["content"][0]["text"]:
+                fails.append(f"C4: a failing queued list must be isError with its output: {res}")
+            mod.CALL_TIMEOUT = 1
+            os.environ["FAKE_TP_QUEUED"] = "slow"
+            try:
+                res = mod.call_tool("queue_list", {})
+            except Exception as e:
+                res = {"isError": False, "content": [{"text": f"raised {e!r}"}]}
+            finally:
+                os.environ.pop("FAKE_TP_QUEUED", None)
+            if not res["isError"] or "timed out" not in res["content"][0]["text"]:
+                fails.append(f"C4: a timeout of the queued list must be isError naming it: {res}")
+            nogit = os.path.join(d, "nogit")
+            os.makedirs(nogit, exist_ok=True)
+            old_path, os.environ["PATH"] = os.environ.get("PATH", ""), nogit
+            try:
+                try:
+                    res = mod.call_tool("queue_add", {"repo_dir": repo, "test_project": "tests/A.csproj"})
+                except Exception as e:
+                    res = {"isError": False, "content": [{"text": f"raised {e!r}"}]}
+                if not res["isError"] or not res["content"][0]["text"].startswith("git rev-parse failed:"):
+                    fails.append(f"C5: no git must give isError starting 'git rev-parse failed:': {res}")
+            finally:
+                os.environ["PATH"] = old_path
+            real_run = subprocess.run
+
+            def hung_git(argv, *a, **kw):
+                if argv and argv[0] == "git":
+                    raise subprocess.TimeoutExpired(argv, kw.get("timeout") or 1)
+                return real_run(argv, *a, **kw)
+
+            subprocess.run = hung_git
+            try:
+                try:
+                    res = mod.call_tool("queue_add", {"repo_dir": repo, "test_project": "tests/A.csproj"})
+                except Exception as e:
+                    res = {"isError": False, "content": [{"text": f"raised {e!r}"}]}
+            finally:
+                subprocess.run = real_run
+            text = res["content"][0]["text"]
+            if not res["isError"] or not text.startswith("git rev-parse failed:") or "timed out" not in text:
+                fails.append(f"C5: a hung git must give isError naming the timeout: {res}")
+        except Exception as e:
+            fails.append(f"in-process checks: exception {e!r}")
+        if os.path.exists(argv_log):
+            logged = open(argv_log).read()
+            if "--args" in logged:
+                fails.append("queue_add must never pass --args")
+            if '"mcp"' not in logged or "--infer-session" not in logged:
+                fails.append("queue add must pass --by mcp and --infer-session")
+            for bad in ('"next"', '"finish"'):
+                if bad in logged:
+                    fails.append(f"argv log has {bad}")
+            if '"queue", "add"' not in logged or "test-phase" not in logged:
+                fails.append("calls must go through test-phase queue")
+        else:
+            fails.append("no argv log written")
+    if fails:
+        for f in fails:
+            print("FAIL:", f)
+        return 1
+    print("tests-mcp self-test: ok")
+    return 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        sys.exit(self_test())
+    serve()
