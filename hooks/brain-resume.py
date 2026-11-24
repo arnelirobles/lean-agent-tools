@@ -80,6 +80,14 @@ def self_test():
         rc, out, err = hook()
         if rc != 0 or "waiting on the user" not in out or "SessionStart" not in out:
             fails.append(f"open item not in context: {rc} {out!r} {err!r}")
+        compact_event = '{"cwd": "%s", "source": "compact"}' % proj
+        for var in ("LEAN_PROFILE", "LEAN_BRAIN_RESUME"):
+            if "waiting on the user" not in hook(compact_event)[1]:
+                fails.append(f"with {var} unset the digest must print")
+            env[var] = "off"
+            if hook(compact_event) != (0, "", ""):
+                fails.append(f"{var}=off must print nothing")
+            del env[var]
         subprocess.run([sys.executable, BRAIN, "add", "--project", "MYPROJ", "--kind", "question", "--ref", "q",
                         "--title", "which port"], env=env, capture_output=True)
         subprocess.run([sys.executable, BRAIN, "add", "--project", "elsewhere", "--kind", "blocker", "--ref", "x",
@@ -114,11 +122,6 @@ def self_test():
         con.close()
         if hook() != (0, "", ""):
             fails.append("nothing open must be silent")
-        for var in ("LEAN_PROFILE", "LEAN_BRAIN_RESUME"):
-            env[var] = "off"
-            if hook('{"cwd": "%s", "source": "compact"}' % proj) != (0, "", ""):
-                fails.append(f"{var}=off must print nothing")
-            del env[var]
         if hook("not json")[0] != 0:
             fails.append("a bad event must not fail")
         # A database locked by another writer: brain waits past the hook's timeout, the hook prints nothing.
