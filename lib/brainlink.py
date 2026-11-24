@@ -119,8 +119,8 @@ def call(args, stdin=None, timeout=None):
     return r.stdout
 
 
-def list_json(args):
-    out = call(["list", "--json"] + list(args))
+def list_json(args, timeout=None):
+    out = call(["list", "--json"] + list(args), timeout=timeout)
     if out is None:
         return None
     try:

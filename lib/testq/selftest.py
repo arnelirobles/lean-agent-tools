@@ -1,11 +1,18 @@
+import contextlib
 import hashlib
+import io
+import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from testq import store  # noqa: E402
+import brainlink  # noqa: E402
+from testq import cli, fakebrain, queue as tq, store  # noqa: E402
 
 # Literal DDL copied from lib/brain/store.py (migrations 2, 3, 4, 6, 7, 8, 9 and the branch column of
 # ensure_extras). The self-test never imports lib/brain.
@@ -72,8 +79,335 @@ def count(con, table):
     return con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
 
+REAL_GIT = shutil.which("git")
+
+
+@contextlib.contextmanager
+def isolated(d, name, fake=None, **extra):
+    """PATH holds only git and, when fake is a dict of FAKE_BRAIN_* knobs, a fake brain; HOME is empty.
+    The environment and the brainlink cache are restored on exit."""
+    saved = dict(os.environ)
+    bin_dir, home = os.path.join(d, name + "-bin"), os.path.join(d, name + "-home")
+    os.makedirs(bin_dir, exist_ok=True)
+    os.makedirs(home, exist_ok=True)
+    if REAL_GIT and not os.path.exists(os.path.join(bin_dir, "git")):
+        os.symlink(REAL_GIT, os.path.join(bin_dir, "git"))  # queue add runs git
+    if fake is not None:
+        fakebrain.install_fake(bin_dir, fake)
+    os.environ.update(PATH=bin_dir, HOME=home, **extra)
+    for k in ("LEAN_SESSION_ID", "LEAN_SESSION_CWD"):
+        os.environ.pop(k, None)
+    brainlink.reset()
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        brainlink.reset()
+
+
+def run(*argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            rc = cli.main(list(argv))
+        except SystemExit as e:
+            rc = e.code if isinstance(e.code, int) else 1
+            if isinstance(e.code, str):
+                print(e.code, file=sys.stderr)
+    return rc, out.getvalue().strip(), err.getvalue().strip()
+
+
+def fake_state(path, items):
+    with open(path, "w") as f:
+        json.dump({"next_id": 100, "items": items}, f)
+
+
+def logged(path):
+    try:
+        with open(path) as f:
+            return [a for a in (json.loads(ln) for ln in f) if a != ["--version"]]
+    except OSError:
+        return []
+
+
+def queue_checks(fails, d):
+    os.environ["LEAN_BRAIN_DB"] = os.path.join(d, "none.db")
+    os.environ["LEAN_TESTS_DB"] = os.path.join(d, "queue.db")
+    repo = os.path.join(d, "r")
+
+    def nxt(*extra):
+        out = run("queue", "next", *extra)[1]
+        return json.loads(out) if out else None
+
+    with isolated(d, "nobrain"):
+        j1 = run("queue", "add", repo, "A.csproj", "--cycle", "q", "--by", "me")[1]
+        j2 = run("queue", "add", repo, "A.csproj", "--tier", "fast", "--filter", "Unit", "--after", j1)[1]
+        j3 = run("queue", "add", repo, "B.csproj", "--after", j2)[1]
+        j4 = run("queue", "add", repo, "C.csproj")[1]
+        if not all(x.isdigit() for x in (j1, j2, j3, j4)):
+            fails.append(f"queue add must print the job id: {[j1, j2, j3, j4]}")
+        if run("queue", "add", repo, "A.csproj", "--tier", "fast")[0] == 0:
+            fails.append("a fast job without a filter accepted")
+        if run("queue", "add", repo, "A.csproj", "--after", "9999")[0] == 0:
+            fails.append("a job after a missing job accepted")
+        first = nxt()
+        if not first or str(first["id"]) != j1 or first["status"] != "queued":
+            fails.append(f"oldest ready job first: {first}")
+        second = nxt()
+        if not second or str(second["id"]) != j4:
+            fails.append(f"a job behind an unfinished dependency must wait: {second}")
+        if nxt("--peek") is not None:
+            fails.append("nothing is ready while the dependencies run")
+        run("queue", "finish", j4, "--status", "done")
+        run("queue", "finish", j1, "--status", "done")
+        third = nxt()
+        if not third or str(third["id"]) != j2:
+            fails.append(f"dependent not ready after its dependency finished: {third}")
+        run("queue", "finish", j2, "--status", "failed", "--reason", "tests failed")
+        out = run("queue", "list", "--status", "cancelled")[1]
+        if f"job #{j3} cancelled" not in out or f"dependency #{j2} failed" not in out:
+            fails.append(f"a failed dependency must cancel its dependents: {out!r}")
+        k1 = run("queue", "add", repo, "D.csproj")[1]
+        k2 = run("queue", "add", repo, "D.csproj", "--after", k1)[1]
+        run("queue", "cancel", k1)
+        if f"job #{k2} cancelled" not in run("queue", "list", "--status", "cancelled")[1]:
+            fails.append("cancel must reach every dependent")
+        rc, _, err = run("queue", "cancel", j1)
+        if rc == 0 or not err.startswith("test-phase: "):
+            fails.append(f"a finished job cannot be cancelled, and the message names test-phase: {rc} {err!r}")
+        d1 = run("queue", "add", repo, "H.csproj", "--tier", "fast", "--filter", "X")[1]
+        rc, d2, err = run("queue", "add", repo, "H.csproj", "--tier", "fast", "--filter", "X", "--by", "other")
+        if rc != 0 or d2 != d1 or f"#{d1}" not in err:
+            fails.append(f"an identical queued job must be joined: {d1} {d2} {err!r}")
+        run("queue", "cancel", d1)
+
+        # one full run per commit, and no full run from a dirty tree
+        g = os.path.join(d, "gitrepo")
+        os.makedirs(g)
+
+        def git(*args):
+            subprocess.run([REAL_GIT, "-C", g, "-c", "user.name=t", "-c", "user.email=t@t", *args], check=True,
+                           capture_output=True)
+        git("init", "-q")
+        with open(os.path.join(g, "f.txt"), "w") as f:
+            f.write("one\n")
+        git("add", "f.txt")
+        git("commit", "-q", "-m", "one")
+        c1 = run("queue", "add", g, "T.csproj")[1]
+        run("queue", "finish", c1, "--status", "done")
+        rc, _, err = run("queue", "add", g, "T.csproj")
+        if rc == 0 or f"#{c1}" not in err or "done" not in err:
+            fails.append(f"a second full job for a commit must be refused with the first id: {rc} {err!r}")
+        rc, c2, _ = run("queue", "add", g, "T.csproj", "--again", "flaky infra")
+        if rc != 0 or c2 == c1 or "again: flaky infra" not in run("queue", "list", "--status", "queued")[1]:
+            fails.append(f"--again must allow a second full job: {rc} {c2!r}")
+        with open(os.path.join(g, "f.txt"), "w") as f:
+            f.write("edited\n")
+        rc, _, err = run("queue", "add", g, "W.csproj")
+        if rc == 0 or "uncommitted" not in err or "f.txt" not in err:
+            fails.append(f"a dirty tree must refuse a full job and name the file: {rc} {err!r}")
+        if run("queue", "add", g, "W.csproj", "--tier", "fast", "--filter", "X")[0] != 0:
+            fails.append("a fast job from a dirty tree must be allowed")
+
+        # bump, move, route, requeue
+        m1, m2, m3 = (run("queue", "add", repo, f"M{i}.csproj")[1] for i in (1, 2, 3))
+        mine = {m1, m2, m3}
+
+        def order():
+            lines = run("queue", "list", "--status", "queued")[1].splitlines()
+            return [i for i in (ln.split()[1][1:] for ln in lines) if i in mine]
+        run("queue", "move", m3, "up")
+        if order() != [m1, m3, m2]:
+            fails.append(f"move up must swap with the job before it: {order()}")
+        run("queue", "bump", m2)
+        if order() != [m2, m1, m3]:
+            fails.append(f"bump must reach the front: {order()}")
+        pa = run("queue", "add", repo, "Z.csproj", "--platform", "apple")[1]
+        rc, out, err = run("queue", "route", pa, "--to", "remote")
+        if rc == 0 or "--force" not in err:
+            fails.append(f"routing an apple job to a remote lane needs --force: {rc} {err!r}")
+        rc, out, _ = run("queue", "route", pa, "--to", "any")
+        if rc != 0 or "platform=" in out:
+            fails.append(f"route any must clear the platform: {rc} {out!r}")
+        for m in mine | {pa}:
+            run("queue", "cancel", m)
+        for ln in run("queue", "list", "--status", "queued")[1].splitlines():
+            run("queue", "cancel", ln.split()[1][1:])
+        r1 = run("queue", "add", repo, "R.csproj")[1]
+        got = nxt("--host", "dev")
+        rc, _, _ = run("queue", "requeue", r1, "--reason", "ssh failed")
+        ql = run("queue", "list", "--status", "queued")[1]
+        if not got or str(got["id"]) != r1 or rc != 0 or "ssh failed" not in ql or "on=" in ql:
+            fails.append(f"requeue must put a running job back with its reason: {got} {rc} {ql!r}")
+        run("queue", "cancel", r1)
+
+        # wait: unknown id exits 2, a timeout exits 3, ended jobs print one line each
+        if run("queue", "wait", "9999")[0] != 2:
+            fails.append("waiting on an unknown job must exit 2")
+        w1 = run("queue", "add", repo, "WA.csproj")[1]
+        rc, out, _ = run("queue", "wait", w1, "--timeout", "1", "--interval", "1")
+        if rc != 3 or f"job #{w1}" not in out:
+            fails.append(f"a wait on a queued job must time out with exit 3: {rc} {out!r}")
+        run("queue", "cancel", w1)
+        rc, out, _ = run("queue", "wait", w1)
+        if rc != 1 or f"job #{w1} cancelled" not in out or "items=-" not in out:
+            fails.append(f"a wait on a cancelled job must exit 1, no brain, items=-: {rc} {out!r}")
+
+    # wait names the items brain holds for the job's run
+    state, log = os.path.join(d, "wait-state.json"), os.path.join(d, "wait-log")
+    fake_state(state, [{"id": 41, "kind": "flaky", "status": "open", "run_id": "1", "title": "t"},
+                       {"id": 42, "kind": "test-fail", "status": "open", "run_id": 1, "title": "u"},
+                       {"id": 43, "kind": "note", "status": "open", "run_id": None, "title": "v"}])
+    with isolated(d, "waitfake", fake={}, FAKE_BRAIN_STATE=state, FAKE_BRAIN_LOG=log):
+        rid = run("run-add", "--project", "wp", "--test-project", "W.csproj", "--tier", "full")[1]
+        wj = run("queue", "add", repo, "WB.csproj")[1]
+        run("queue", "finish", wj, "--status", "done", "--run-id", rid)
+        rc, out, _ = run("queue", "wait", wj)
+        if rc != 0 or "items=#41,#42" not in out:
+            fails.append(f"wait must list the item ids brain holds for the run: {rc} {out!r}")
+
+
+def session_checks(fails, d):
+    os.environ["LEAN_BRAIN_DB"] = os.path.join(d, "none.db")
+    os.environ["LEAN_TESTS_DB"] = os.path.join(d, "session.db")
+    with isolated(d, "sess-none"):
+        if tq.job_session() != ("", ""):
+            fails.append(f"job_session with no brain must return empty strings: {tq.job_session()}")
+        os.environ.update(LEAN_SESSION_ID="env-id", LEAN_SESSION_CWD="/env/cwd")
+        if tq.job_session() != ("env-id", "/env/cwd"):
+            fails.append(f"job_session must return the environment values: {tq.job_session()}")
+    log = os.path.join(d, "sess-log")
+    with isolated(d, "sess-fake", fake={}, FAKE_BRAIN_STATE=os.path.join(d, "sess-state.json"),
+                  FAKE_BRAIN_LOG=log):
+        got = tq.job_session()
+        if got != ("fake-session", os.getcwd()):
+            fails.append(f"job_session must return what session infer gave: {got}")
+        if ["session", "infer", "--json"] not in logged(log):
+            fails.append("job_session must call session infer --json")
+        os.environ.update(LEAN_SESSION_ID="env-id", LEAN_SESSION_CWD="/env/cwd")
+        n = len(logged(log))
+        if tq.job_session() != ("env-id", "/env/cwd") or len(logged(log)) != n:
+            fails.append("the environment must win and brain must not be asked")
+        os.environ.pop("LEAN_SESSION_ID")
+        os.environ.pop("LEAN_SESSION_CWD")
+        jid = run("queue", "add", os.path.join(d, "r"), "S.csproj", "--infer-session")[1]
+        row = store.connect().execute("SELECT session_id, session_cwd FROM jobs WHERE id=?", (jid,)).fetchone()
+        if not row or row["session_id"] != "fake-session":
+            fails.append(f"queue add --infer-session must store the inferred session: {row and tuple(row)}")
+    with isolated(d, "sess-slow", fake={"FAKE_BRAIN_SLEEP": "8"}):
+        t0 = time.time()
+        got = tq.job_session()
+        if got != ("", "") or time.time() - t0 > 7.5:
+            fails.append(f"a slow brain must not hang job_session: {got} after {time.time() - t0:.1f}s")
+
+
+def flaky_checks(fails, d):
+    os.environ["LEAN_BRAIN_DB"] = os.path.join(d, "none.db")
+    os.environ["LEAN_TESTS_DB"] = os.path.join(d, "flaky.db")
+    state, log = os.path.join(d, "flaky-state.json"), os.path.join(d, "flaky-log")
+    seen = "2026-01-01T00:00:00Z"
+    fake_state(state, [
+        {"id": 1, "kind": "flaky", "status": "open", "project": "core", "run_id": "1", "ref": "A.One",
+         "title": "A.One", "last_seen": seen},
+        {"id": 2, "kind": "flaky", "status": "open", "project": "core", "run_id": "2", "ref": "B.One",
+         "title": "B.One", "last_seen": seen},
+        {"id": 3, "kind": "test-fail", "status": "open", "project": "core", "run_id": "1", "ref": "A.Real",
+         "title": "A.Real", "last_seen": seen}])
+    closes = lambda: [a for a in logged(log) if a[:1] == ["close"]]  # noqa: E731
+    with isolated(d, "flaky", fake={}, FAKE_BRAIN_STATE=state, FAKE_BRAIN_LOG=log):
+        def frun(test, started, rc, tier="full", passed=3, failed=0):
+            return run("run-add", "--project", "core", "--test-project", test, "--tier", tier, "--started",
+                       str(started), "--exit-code", str(rc), "--passed", str(passed), "--failed", str(failed))[1]
+        if frun("A.csproj", 1000, 1, failed=1) != "1" or frun("B.csproj", 1000, 1, failed=1) != "2":
+            fails.append("run-add must print the run ids")
+        for i in range(5):  # all before the item was last seen
+            frun("A.csproj", 1001 + i, 0)
+        rc, out, _ = run("flaky-clear", "--project", "core", "--test-project", "A.csproj")
+        if rc != 0 or out or closes():
+            fails.append(f"passing runs older than the last sighting must not clear it: {rc} {out!r} {closes()}")
+        future = 4102444800  # year 2100
+        for i in range(4):
+            frun("A.csproj", future + i, 0)
+        frun("A.csproj", future + 9, 1, failed=1)
+        frun("A.csproj", future + 10, 0, tier="rerun")
+        frun("B.csproj", future + 11, 0)
+        run("flaky-clear", "--project", "core", "--test-project", "A.csproj")
+        if closes():
+            fails.append(f"4 passing runs must not clear it: {closes()}")
+        frun("A.csproj", future + 12, 0)
+        rc, out, _ = run("flaky-clear", "--project", "core", "--test-project", "A.csproj")
+        got = closes()
+        if len(got) != 1 or got[0][:4] != ["close", "1", "--resolution", "flaky-cleared"] \
+                or "5 passing runs" not in " ".join(got[0]) or "closed: #1" not in out:
+            fails.append(f"5 passing runs must close the flaky item through brain: {rc} {out!r} {got}")
+        run("flaky-clear", "--project", "core", "--test-project", "A.csproj")
+        if len(closes()) != 1:
+            fails.append("an item already closed must not be closed again, nor another test project's or kind's")
+        if run("flaky-clear", "--project", "core", "--test-project", "B.csproj", "--runs", "0")[0] == 0:
+            fails.append("--runs 0 must be refused")
+    with isolated(d, "flaky-none"):
+        rc, out, err = run("flaky-clear", "--project", "core", "--test-project", "A.csproj")
+        if (rc, out) != (0, ""):
+            fails.append(f"flaky-clear with no brain must do nothing: {rc} {out!r} {err!r}")
+
+
+def stats_checks(fails, d):
+    os.environ["LEAN_BRAIN_DB"] = os.path.join(d, "none.db")
+    os.environ["LEAN_TESTS_DB"] = os.path.join(d, "stats.db")
+    state, log = os.path.join(d, "stats-state.json"), os.path.join(d, "stats-log")
+    fake_state(state, [
+        {"id": 1, "kind": "flaky", "status": "closed", "project": "core", "run_id": "2", "title": "x"},
+        {"id": 2, "kind": "test-fail", "status": "open", "project": "core", "run_id": "2", "title": "y"},
+        {"id": 3, "kind": "flaky", "status": "open", "project": "core", "run_id": "9", "title": "gone"}])
+    with isolated(d, "stats", fake={}, FAKE_BRAIN_STATE=state, FAKE_BRAIN_LOG=log):
+        for tier, dur, wait in (("full", 100, 10), ("full", 300, 30), ("rerun", 5, 0)):
+            run("run-add", "--cycle", "c1", "--project", "core", "--test-project", "T.csproj", "--tier", tier,
+                "--runner", "mtp", "--started", "1000", "--ended", str(1000 + dur), "--lane-wait", str(wait),
+                "--passed", "9", "--failed", "1", "--exit-code", "1")
+        rc, out, _ = run("stats", "--json")
+        try:
+            s = json.loads(out)
+        except ValueError:
+            s = {}
+            fails.append(f"stats --json is not json: {out!r}")
+        suite = (s.get("suites") or [{}])[0]
+        if suite.get("runs") != 2 or suite.get("mean_duration_s") != 200 or suite.get("mean_lane_wait_s") != 20 \
+                or suite.get("flaky_items") != 1 or suite.get("flaky_rate") != 0.5:
+            fails.append(f"suite stats wrong (reruns are not runs, closed flaky items count): {suite}")
+        if (s.get("slowest") or [{}])[0].get("duration_s") != 300:
+            fails.append(f"slowest wrong: {s.get('slowest')}")
+        if ["list", "--json", "--kind", "flaky"] not in logged(log):
+            fails.append(f"stats must ask brain for every flaky item: {logged(log)}")
+        rc, out, _ = run("stats")
+        if "flaky rate" not in out or "T.csproj" not in out or "slowest runs" not in out:
+            fails.append(f"stats table: {out!r}")
+    with isolated(d, "stats-none"):
+        s = json.loads(run("stats", "--json")[1])
+        suite = (s.get("suites") or [{}])[0]
+        if suite.get("flaky_items") != "brain not installed" or suite.get("flaky_rate") != "brain not installed" \
+                or suite.get("runs") != 2 or not s.get("slowest"):
+            fails.append(f"stats with no brain must say so for flaky items and rate: {suite}")
+
+
+def refused_checks(fails, d):
+    brain = os.path.join(d, "refuse-brain.db")
+    make_brain(brain, 9, [(1, "queued"), (2, "running")], [])
+    os.environ["LEAN_BRAIN_DB"] = brain
+    os.environ["LEAN_TESTS_DB"] = os.path.join(d, "refuse.db")
+    want = ("test-phase: brain.db still has 2 queued or running jobs. "
+            "Drain them with lean-agent-tools 1.x, then run this again.")
+    with isolated(d, "refuse"):
+        for argv in (("queue", "list"), ("stats",), ("run-add", "--project", "p", "--test-project", "t",
+                                                    "--tier", "full")):
+            rc, out, err = run(*argv)
+            if rc != 2 or err != want or out:
+                fails.append(f"{argv[0]} while the copy is refused must exit 2 with the message: {rc} {err!r}")
+
+
 def self_test():
     fails = []
+    saved_env = dict(os.environ)
     with tempfile.TemporaryDirectory() as d:
         brain = os.path.join(d, "brain.db")
         os.environ["LEAN_BRAIN_DB"] = brain
@@ -222,6 +556,11 @@ def self_test():
         if count(con, "jobs") != 2:
             fails.append("after the jobs are done the next connect must copy")
         con.close()
+
+        for checks in (queue_checks, session_checks, flaky_checks, stats_checks, refused_checks):
+            checks(fails, d)
+    os.environ.clear()
+    os.environ.update(saved_env)
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
         return 1

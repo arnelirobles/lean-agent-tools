@@ -2117,6 +2117,9 @@ def is_bad(r):
 def main(argv):
     if argv[:1] == ["--gradle-run"] and len(argv) > 1:
         return gradle_run(argv[1:])
+    if argv[:1] and argv[0] in ("queue", "run-add", "flaky-clear", "stats"):
+        from testq import cli
+        return cli.main(argv)
     p = argparse.ArgumentParser(prog="test-phase", description="Drain the test queue.")
     p.add_argument("plan", nargs="?")
     p.add_argument("--lane", default="dotnet")
@@ -2868,7 +2871,7 @@ def needs_checks(fails):
             fh.write('#!/bin/sh\necho "$*" >> "$FAKE_LOG"\n[ "$1" = build ] && exit 0\nf="$FAKE_DIR/out-$(basename "$2")"\ncat "$f"\nexit "$(cat "$f.rc")"\n')
         os.chmod(os.path.join(shims, "dotnet"), 0o755)
         env = dict(os.environ, PATH=shims + os.pathsep + os.environ["PATH"], FAKE_DIR=d, HOME=d,
-                   FAKE_LOG=os.path.join(d, "calls.log"), LEAN_BRAIN_DB=os.path.join(d, "brain.db"),
+                   FAKE_LOG=os.path.join(d, "calls.log"), LEAN_BRAIN_DB=os.path.join(d, "brain.db"), LEAN_TESTS_DB=os.path.join(d, "tests.db"),
                    LEAN_DB=os.path.join(d, "lean.db"), HEAVY_LOCK_DIR=os.path.join(d, "locks"),
                    LEAN_TEST_PHASE_DIR=os.path.join(d, "runs"), HEAVY_WAIT="20", TEST_PHASE_REMOTES="off")
         env.pop("TEST_PHASE_RUNNER", None)
@@ -3457,7 +3460,7 @@ echo "Test Run Successful."; echo "Total tests: 1"; echo "     Passed: 1"; exit 
 ''')
         os.chmod(shim, 0o755)
         env = dict(os.environ, PATH=bin_dir + os.pathsep + os.environ["PATH"], FAKE_DIR=d, FAKE_BRAIN=BRAIN,
-                   FAKE_LOG=os.path.join(d, "calls.log"), LEAN_BRAIN_DB=os.path.join(d, "brain.db"),
+                   FAKE_LOG=os.path.join(d, "calls.log"), LEAN_BRAIN_DB=os.path.join(d, "brain.db"), LEAN_TESTS_DB=os.path.join(d, "tests.db"),
                    HEAVY_LOCK_DIR=os.path.join(d, "locks"), LEAN_TEST_PHASE_DIR=os.path.join(d, "runs"),
                    HEAVY_WAIT="20", TEST_PHASE_REMOTES="off")
         env.pop("TEST_PHASE_RUNNER", None)
