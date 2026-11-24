@@ -12,7 +12,7 @@ import brainlink  # noqa: E402
 import gradle_args  # noqa: E402
 from test_kinds import DOTNET_FILES, GO_PATTERN, SUPPORTED_KINDS  # noqa: E402
 
-from .store import connect, copy_done, now
+from .store import brain_db_path, connect, copy_done, now
 
 BRAIN_TIMEOUT = 5
 
@@ -299,8 +299,17 @@ def cmd_queue(a):
         if copy_done():
             print("the queue was already copied from brain.db, nothing to do")
             return 0
-        connect(cancel_live=a.cancel_live).close()
-        print("copied the jobs and runs from brain.db into tests.db")
+        report = []
+        connect(cancel_live=a.cancel_live, report=report).close()
+        result = report[-1]
+        if result.status == "unreadable":  # connect already printed the line
+            return 1
+        if result.status == "none":
+            print(f"no brain.db at {brain_db_path()}, nothing to copy")
+        elif result.status == "already":
+            print("the queue was already copied from brain.db, nothing to do")
+        else:
+            print(f"copied {result.jobs} jobs and {result.runs} runs from {brain_db_path()}")
         return 0
     con = connect()
     if a.qcmd == "wait":

@@ -3,7 +3,7 @@
 brain is a separate plugin and may be missing or old. find_brain() looks on PATH, then in the plugin
 cache under ~/.claude/plugins/cache/*/brain/<version>/tools/brain (newest version first), and accepts
 the first candidate whose `--version` prints `brain X.Y.Z` at least MIN_VERSION. call() runs it and
-returns stdout, or None with one stderr line when brain is missing or fails.
+returns stdout, or None with one stderr line when brain is missing or fails; call_status() also says which.
 
   brainlink.py --self-test
 """
@@ -19,9 +19,12 @@ import time
 MIN_VERSION = (1, 0, 0)
 VERSION_TIMEOUT = 5
 PREFIX = "lean-agent-tools: brain failed: "
+MISSING = "missing"
+FAILED = "failed"
 
 _cache = None
 _warned = set()
+_discovery_timed_out = False
 
 
 class _OutOfTime(Exception):
@@ -69,7 +72,7 @@ def _cache_candidates(home):
 def find_brain(env=None, home=None, timeout=None):
     """Return the path of a usable brain, or None. With timeout, discovery stops when it runs out:
     one stderr line, None, and nothing is cached, so a later call with more time can still find it."""
-    global _cache
+    global _cache, _discovery_timed_out
     default = env is None and home is None
     if default and _cache:
         return _cache
@@ -85,6 +88,7 @@ def find_brain(env=None, home=None, timeout=None):
         try:
             ok = _version_ok(path, dict(e), deadline)
         except _OutOfTime:
+            _discovery_timed_out = True
             _warn(f"{PREFIX}discovery timed out after {timeout}s")
             return None
         if ok:
@@ -97,11 +101,19 @@ def find_brain(env=None, home=None, timeout=None):
     return None
 
 
-def call(args, stdin=None, timeout=None):
+def call_status(args, stdin=None, timeout=None):
+    """Run brain. Returns (stdout, None) on success, else (None, failure) where failure is
+    (MISSING, "") when no usable brain exists or (FAILED, reason) when brain was there and failed:
+    reason is "exit N", "timed out after Ns" or the OS error. The stderr line is the same as call()."""
+    global _discovery_timed_out
     start = time.monotonic()
+    _discovery_timed_out = False
     path = find_brain(timeout=timeout)
     if not path:
-        return None
+        if _discovery_timed_out:
+            return None, (FAILED, f"timed out after {timeout:g}s")
+        return None, (MISSING, "")
+    limit = timeout
     if timeout is not None:
         timeout = max(timeout - (time.monotonic() - start), 0.01)
     try:
@@ -109,28 +121,37 @@ def call(args, stdin=None, timeout=None):
                            text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         _warn(f"{PREFIX}timed out after {timeout}s running {' '.join(args)}")
-        return None
+        return None, (FAILED, f"timed out after {limit:g}s")
     except OSError as e:
         _warn(f"{PREFIX}{e}")
-        return None
+        return None, (FAILED, str(e))
     if r.returncode != 0:
         _warn(PREFIX + (r.stderr.strip() or f"exit {r.returncode}"))
-        return None
-    return r.stdout
+        return None, (FAILED, f"exit {r.returncode}")
+    return r.stdout, None
 
 
-def list_json(args, timeout=None):
-    out = call(["list", "--json"] + list(args), timeout=timeout)
+def call(args, stdin=None, timeout=None):
+    return call_status(args, stdin, timeout)[0]
+
+
+def list_json_status(args, timeout=None):
+    """Like list_json, with the failure of call_status as a second value."""
+    out, failure = call_status(["list", "--json"] + list(args), timeout=timeout)
     if out is None:
-        return None
+        return None, failure
     try:
         data = json.loads(out)
     except ValueError:
         data = None
     if not isinstance(data, list):
         _warn(PREFIX + "list output is not a JSON array")
-        return None
-    return data
+        return None, (FAILED, "list output is not a JSON array")
+    return data, None
+
+
+def list_json(args, timeout=None):
+    return list_json_status(args, timeout)[0]
 
 
 def self_test():

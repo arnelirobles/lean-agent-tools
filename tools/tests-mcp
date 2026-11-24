@@ -28,6 +28,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 TEST_PHASE = os.path.join(HERE, "test-phase")
 DEFAULT_PROTOCOL = "2025-06-18"
 CALL_TIMEOUT = 60
+GIT_TIMEOUT = 10
 
 
 def plugin_version():
@@ -125,8 +126,10 @@ def after_queue_list(a, text):
     if not status:
         # Running jobs, then queued ones in the order the drainer takes them, so a cut drops the last to run.
         extra = ["--cycle=" + a["cycle"]] if a.get("cycle") else []
-        rc, out, _ = run_test_phase(["queue", "list", "--status=queued", *extra], None)
-        lines = text.splitlines() + (out.splitlines() if rc == 0 else [])
+        rc, out, err = run_test_phase(["queue", "list", "--status=queued", *extra], None)
+        if rc != 0:
+            return result(err.strip() or out.strip() or f"test-phase exited {rc}", True)
+        lines = text.splitlines() + out.splitlines()
     elif status in ("queued", "running"):
         lines = text.splitlines()
     else:
@@ -161,7 +164,13 @@ def t_queue_add(a):
     # No extra dotnet arguments here: they run on the drainer's machine, so they stay a shell-only choice.
     # Only the top of a git work tree: a queued job builds and runs that folder's code, and a remote
     # lane copies its files, so a scratch folder somewhere is not a place to queue from.
-    top = subprocess.run(["git", "-C", args[2], "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    try:
+        top = subprocess.run(["git", "-C", args[2], "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+                             timeout=GIT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise Bad(f"git rev-parse failed: timed out after {GIT_TIMEOUT} seconds")
+    except OSError as e:
+        raise Bad(f"git rev-parse failed: {e}")
     if not os.path.isdir(args[2]) or top.returncode != 0 or \
             os.path.realpath(top.stdout.strip()) != os.path.realpath(args[2]):
         raise Bad("repo_dir must be the top folder of a git work tree")
@@ -239,7 +248,14 @@ def call_tool(name, a):
     if rc != 0:
         return result((err.strip() or out.strip() or f"test-phase exited {rc}"), True)
     if name in AFTER:
-        out = AFTER[name](a, out)
+        try:
+            out = AFTER[name](a, out)
+        except subprocess.TimeoutExpired:
+            return result(f"test-phase timed out after {CALL_TIMEOUT} seconds", True)
+        except OSError as e:
+            return result(f"could not run test-phase: {e}", True)
+        if isinstance(out, dict):  # the follow-up call failed: its error result
+            return out
     return result(out.strip() or "ok")
 
 

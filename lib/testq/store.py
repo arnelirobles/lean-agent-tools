@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import sys
 import time
 from urllib.parse import quote
 
@@ -80,54 +81,81 @@ def copy_done(path=None):
         con.close()
 
 
+class Copy:
+    """What copy_from_brain did. status is "copied" (jobs and runs hold the row counts), "already" (the marker
+    was there), "none" (no brain.db at the path) or "unreadable" (brain.db could not be read; error says why)."""
+
+    def __init__(self, status, jobs=0, runs=0, error=""):
+        self.status, self.jobs, self.runs, self.error = status, jobs, runs, error
+
+
+def _read_source(src, con_columns, cancel_live):
+    """Read jobs and runs of the brain.db at src in one snapshot. Returns {table: (shared columns, rows)}.
+    Raises CopyRefused while src has live jobs, unless cancel_live. src is never written."""
+    uri = "file:" + quote(os.path.abspath(src)) + "?mode=ro"
+    source = sqlite3.connect(uri, uri=True, isolation_level=None)
+    try:
+        source.row_factory = sqlite3.Row
+        source.execute("BEGIN")  # one snapshot for the live count and the row reads
+        if _has_table(source, "jobs") and not cancel_live:
+            live = source.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running')").fetchone()[0]
+            if live:
+                raise CopyRefused(live)
+        data = {}
+        for table in ("runs", "jobs"):  # runs first, jobs.run_id points at it
+            if not _has_table(source, table):
+                continue
+            shared = [c for c in _columns(source, table) if c in con_columns[table]]
+            cols = ", ".join(shared)
+            data[table] = (shared, [list(r) for r in source.execute(f"SELECT {cols} FROM {table} ORDER BY id")])
+        return data
+    finally:
+        source.close()
+
+
 def copy_from_brain(con, src, cancel_live=False):
     """Copy jobs and runs from the brain.db at src into con, once. con must be in autocommit mode.
-    Returns the number of rows copied. Raises CopyRefused, with nothing written, while src has live jobs,
-    unless cancel_live: then each live job lands in con as cancelled. src is never written."""
+    Returns a Copy. Raises CopyRefused, with nothing written, while src has live jobs, unless cancel_live:
+    then each live job lands in con as cancelled. src is never written. A brain.db that cannot be read gives
+    status "unreadable" and no marker, so a later run tries again; so does a missing file. Errors on con
+    propagate."""
     con.execute("BEGIN IMMEDIATE")
-    source = None
     try:
         if con.execute("SELECT 1 FROM meta WHERE key=?", (MARKER,)).fetchone():
             con.execute("COMMIT")
-            return 0
-        copied = 0
-        if os.path.exists(src):
-            uri = "file:" + quote(os.path.abspath(src)) + "?mode=ro"
-            source = sqlite3.connect(uri, uri=True, isolation_level=None)
-            source.row_factory = sqlite3.Row
-            source.execute("BEGIN")  # one snapshot for the live count and the row reads
-            if _has_table(source, "jobs") and not cancel_live:
-                live = source.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running')").fetchone()[0]
-                if live:
-                    raise CopyRefused(live)
-            for table in ("runs", "jobs"):  # runs first, jobs.run_id points at it
-                if not _has_table(source, table):
-                    continue
-                shared = [c for c in _columns(source, table) if c in _columns(con, table)]
-                cols = ", ".join(shared)
-                marks = ", ".join("?" for _ in shared)
-                for row in source.execute(f"SELECT {cols} FROM {table} ORDER BY id"):
-                    values = list(row)
-                    if cancel_live and table == "jobs" and row["status"] in ("queued", "running"):
-                        values[shared.index("status")] = "cancelled"
-                        values[shared.index("reason")] = CANCEL_REASON
-                        if "ended_at" in shared:
-                            values[shared.index("ended_at")] = now()
-                    con.execute(f"INSERT INTO {table} ({cols}) VALUES ({marks})", values)
-                    copied += 1
+            return Copy("already")
+        if not os.path.exists(src):  # lost a race with a delete: nothing was read, so no marker
+            con.execute("COMMIT")
+            return Copy("none")
+        con_columns = {t: _columns(con, t) for t in ("runs", "jobs")}
+        try:
+            data = _read_source(src, con_columns, cancel_live)
+        except sqlite3.DatabaseError as e:
+            con.execute("ROLLBACK")
+            return Copy("unreadable", error=" ".join(str(e).split()))
+        counts = {"runs": 0, "jobs": 0}
+        for table, (shared, rows) in data.items():
+            cols = ", ".join(shared)
+            marks = ", ".join("?" for _ in shared)
+            for values in rows:
+                if cancel_live and table == "jobs" and values[shared.index("status")] in ("queued", "running"):
+                    values[shared.index("status")] = "cancelled"
+                    values[shared.index("reason")] = CANCEL_REASON
+                    if "ended_at" in shared:
+                        values[shared.index("ended_at")] = now()
+                con.execute(f"INSERT INTO {table} ({cols}) VALUES ({marks})", values)
+                counts[table] += 1
         con.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (MARKER, now()))
         con.execute("COMMIT")
-        return copied
+        return Copy("copied", counts["jobs"], counts["runs"])
     except BaseException:
         if con.in_transaction:
             con.execute("ROLLBACK")
         raise
-    finally:
-        if source is not None:
-            source.close()
 
 
-def connect(timeout=30, cancel_live=False):
+def connect(timeout=30, cancel_live=False, report=None):
+    """Open tests.db, set it up, and run the one-time copy. A list passed as report gets the Copy appended."""
     path = db_path()
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     con = sqlite3.connect(path, timeout=timeout, isolation_level=None)
@@ -156,8 +184,17 @@ def connect(timeout=30, cancel_live=False):
             con.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
                         (str(SCHEMA_VERSION),))
             con.execute("COMMIT")
-        if not meta(MARKER):
-            copy_from_brain(con, brain_db_path(), cancel_live)
+        if meta(MARKER):
+            result = Copy("already")
+        elif not os.path.exists(brain_db_path()):  # nothing to read: no marker, no write lock
+            result = Copy("none")
+        else:
+            result = copy_from_brain(con, brain_db_path(), cancel_live)
+        if result.status == "unreadable":
+            print(f"test-phase: could not read {brain_db_path()} ({result.error}); the 1.x queue was not copied. "
+                  "Fix or move that file, then run test-phase queue import.", file=sys.stderr)
+        if report is not None:
+            report.append(result)
     except BaseException:
         if con.in_transaction:
             con.execute("ROLLBACK")

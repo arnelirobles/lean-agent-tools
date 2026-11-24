@@ -1211,6 +1211,12 @@ def brain(args, stdin=None):
     return None if out is None else out.strip()
 
 
+def brain_status(args, stdin=None):
+    """Like brain(), with the failure as a second value: None, ("missing", "") or ("failed", reason)."""
+    out, failure = brainlink.call_status(args, stdin=stdin, timeout=BRAIN_TIMEOUT)
+    return (None if out is None else out.strip()), failure
+
+
 def brain_items(args):
     """Items from `brain list --json`; an empty list when brain is missing or fails."""
     return brainlink.list_json(args, timeout=BRAIN_TIMEOUT) or []
@@ -1305,9 +1311,12 @@ def add_item(row, kind, ref, severity, body, run_id, ctx, tags=()):
     for t in tags:
         args += ["--tag", t]
     text = mask(body)
-    if brain(args, stdin=text) is None and ctx.get("log"):  # the body goes by stdin, not argv, where any user's ps could read it
+    out, failure = brain_status(args, stdin=text)  # the body goes by stdin, not argv, where any user's ps could read it
+    if out is None and ctx.get("log"):
+        head = "brain not installed, not filed:" if failure[0] == brainlink.MISSING \
+            else f"brain add failed ({failure[1]}), not filed:"
         with open(ctx["log"], "a") as fh:
-            fh.write("\nbrain not installed, not filed:\n" f"kind: {kind}\nref: {ref}\ntitle: {ref}\n"
+            fh.write(f"\n{head}\n" f"kind: {kind}\nref: {ref}\ntitle: {ref}\n"
                      + "\n".join(text.splitlines()[:40]) + "\n")
 
 

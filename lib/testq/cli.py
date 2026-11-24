@@ -42,7 +42,7 @@
   test-phase queue next [--peek] [--where local|remote] [--host NAME]   (what test-phase uses to drain)
   test-phase queue finish ID --status done|failed | requeue ID --reason R   (requeue puts a running job back)
   test-phase stats [--json]      suites (runs, mean lane wait and duration, flaky items) and the slowest runs;
-            flaky items come from brain and read "brain not installed" without it
+            flaky items come from brain and read "brain not installed" without it, "brain failed" when it fails
 
 The file is ${LEAN_TESTS_DB:-~/.local/share/lean/tests.db}. The first open copies the jobs and runs of an old
 brain.db and refuses while that file still has queued or running jobs. A plan file named queue is passed as ./queue.
