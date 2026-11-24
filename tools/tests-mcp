@@ -76,6 +76,8 @@ def need_str(a, k):
     # A value that starts with a dash would be read as an option, not as the value.
     if v.startswith("-"):
         raise Bad(f"{k} must not start with -")
+    if "\0" in v:
+        raise Bad(f"{k} must not contain a null byte")
     return v
 
 
@@ -90,6 +92,8 @@ def opt(a, args, key, flag=None, kind=str):
         v = str(v)
     elif not isinstance(v, str):
         raise Bad(f"{key} must be a string")
+    if "\0" in v:
+        raise Bad(f"{key} must not contain a null byte")
     # --flag=value keeps a value such as "-1 offset" a value.
     args.append((flag or "--" + key.replace("_", "-")) + "=" + v)
 
@@ -169,7 +173,7 @@ def t_queue_add(a):
                              timeout=GIT_TIMEOUT)
     except subprocess.TimeoutExpired:
         raise Bad(f"git rev-parse failed: timed out after {GIT_TIMEOUT} seconds")
-    except OSError as e:
+    except (OSError, ValueError) as e:
         raise Bad(f"git rev-parse failed: {e}")
     if not os.path.isdir(args[2]) or top.returncode != 0 or \
             os.path.realpath(top.stdout.strip()) != os.path.realpath(args[2]):
@@ -243,7 +247,7 @@ def call_tool(name, a):
         rc, out, err = run_test_phase(args, stdin)
     except subprocess.TimeoutExpired:
         return result(f"test-phase timed out after {CALL_TIMEOUT} seconds", True)
-    except OSError as e:
+    except (OSError, ValueError) as e:
         return result(f"could not run test-phase: {e}", True)
     if rc != 0:
         return result((err.strip() or out.strip() or f"test-phase exited {rc}"), True)
@@ -252,7 +256,7 @@ def call_tool(name, a):
             out = AFTER[name](a, out)
         except subprocess.TimeoutExpired:
             return result(f"test-phase timed out after {CALL_TIMEOUT} seconds", True)
-        except OSError as e:
+        except (OSError, ValueError) as e:
             return result(f"could not run test-phase: {e}", True)
         if isinstance(out, dict):  # the follow-up call failed: its error result
             return out
