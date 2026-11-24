@@ -1,3 +1,4 @@
+import json
 import re
 import sys
 import time
@@ -96,6 +97,10 @@ def cmd_add(a):
     return 0
 
 
+JSON_COLUMNS = ("id", "kind", "status", "project", "repo", "branch", "cycle", "run_id", "ref", "title",
+                "first_seen", "last_seen")
+
+
 def cmd_list(a):
     q, args = "SELECT DISTINCT items.* FROM items", []
     if a.tag:
@@ -109,7 +114,11 @@ def cmd_list(a):
             q += f" AND items.{col}=?"
             args.append(val)
     con = connect()
-    for r in con.execute(q + " ORDER BY items.id", args).fetchall():
+    rows = con.execute(q + " ORDER BY items.id", args).fetchall()
+    if a.json:
+        print(json.dumps([dict({k: r[k] for k in JSON_COLUMNS}, tags=tags_of(con, r["id"])) for r in rows]))
+        return 0
+    for r in rows:
         print(line(con, r))
     return 0
 
@@ -156,6 +165,12 @@ def cmd_close(a):
 
 
 def cmd_session(a):
+    if a.action == "infer":
+        sid, cwd = infer_session(connect())
+        print(json.dumps({"id": sid, "cwd": cwd}))
+        return 0
+    if not a.id:
+        sys.exit("brain: session start, end and status need an id")
     if not session_ok(a.id):
         sys.exit("brain: a session id takes letters, digits and dashes only")
     con = connect()

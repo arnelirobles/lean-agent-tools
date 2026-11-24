@@ -58,6 +58,11 @@
   brain stats [--json]
   brain export [--format md|json] [--project P] [--status S]
   brain session start|end|status ID [--cwd DIR]
+  brain session infer --json      {"id": "...", "cwd": "..."} of the one open session started in this folder, else both empty
+  brain list --json               the same rows as list, as a JSON array
+  brain notice add --hook H [--session S] [--cwd C]      the text on stdin; prints the id (same hook and text within 10 minutes is one notice)
+  brain created add --kind K --forge F --url U [--repo R --branch B --number N --title T --session S --cwd C]      prints the id
+  brain --version
   brain answers --session ID
   brain serve [--port N] [--roots A,B] [--idle-exit MIN] [--install always|session|manual | --uninstall]
             the brain page at http://leanagent.localhost:PORT (also http://127.0.0.1:PORT), port 8770 or
@@ -118,6 +123,7 @@ import threading
 import time
 import urllib.request
 
+from .version import VERSION
 from .store import norm_project, MODEL, PHASE, RESOLUTION, RUNNERS, SEVERITY, SOURCE, STATUS, TIERS
 from .items import cmd_add, cmd_answers, cmd_close, cmd_list, cmd_reopen, cmd_run_add, cmd_session, cmd_show
 from .flaky import cmd_flaky_clear
@@ -136,6 +142,7 @@ def lower(s):
 
 def parser():
     p = argparse.ArgumentParser(prog="brain", description=__doc__.split("\n")[0])
+    p.add_argument("--version", action="version", version=f"brain {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("add")
     s.add_argument("--project", required=True, type=lower)
@@ -169,6 +176,7 @@ def parser():
     s.add_argument("--kind")
     s.add_argument("--tag")
     s.add_argument("--cycle")
+    s.add_argument("--json", action="store_true", help="a JSON array of objects, same rows and order")
     s.set_defaults(fn=cmd_list)
     s = sub.add_parser("show")
     s.add_argument("id", type=int)
@@ -183,9 +191,10 @@ def parser():
     s.add_argument("--delivered", action="store_true", help="the answer already reached the asking session")
     s.set_defaults(fn=cmd_close)
     s = sub.add_parser("session")
-    s.add_argument("action", choices=("start", "end", "status"))
-    s.add_argument("id")
+    s.add_argument("action", choices=("start", "end", "status", "infer"))
+    s.add_argument("id", nargs="?", default="")
     s.add_argument("--cwd", default="")
+    s.add_argument("--json", action="store_true", help="with infer: print {\"id\": ..., \"cwd\": ...}")
     s.set_defaults(fn=cmd_session)
     s = sub.add_parser("answers")
     s.add_argument("--session", required=True)
@@ -290,12 +299,26 @@ def parser():
     s.set_defaults(fn=cmd_activity)
     s = sub.add_parser("created")
     cs = s.add_subparsers(dest="ccmd", required=True)
+    q = cs.add_parser("add")
+    q.add_argument("--kind", required=True, choices=("pr", "issue", "release", "workitem"))
+    q.add_argument("--forge", required=True, choices=("github", "azure"))
+    q.add_argument("--url", required=True)
+    q.add_argument("--repo", default="")
+    q.add_argument("--branch", default="")
+    q.add_argument("--number", type=int)
+    q.add_argument("--title", default="")
+    q.add_argument("--session", default="")
+    q.add_argument("--cwd", default="")
     q = cs.add_parser("list")
     q.add_argument("--open", action="store_true", help="only items not known to be closed or merged")
     q.add_argument("--limit", type=int, default=50)
     s.set_defaults(fn=cmd_created)
     s = sub.add_parser("notice")
     ns = s.add_subparsers(dest="ncmd", required=True)
+    q = ns.add_parser("add")
+    q.add_argument("--hook", required=True)
+    q.add_argument("--session", default="")
+    q.add_argument("--cwd", default="")
     q = ns.add_parser("list")
     q.add_argument("--all", action="store_true", help="include dismissed notices")
     q.add_argument("--limit", type=int, default=50)

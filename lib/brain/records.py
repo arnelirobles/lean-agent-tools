@@ -46,6 +46,9 @@ def created_line(r):
 
 def cmd_created(a):
     con = connect()
+    if a.ccmd == "add":
+        print(add_created(con, a.kind, a.forge, a.repo, a.branch, a.url, a.number, a.title, a.session, a.cwd))
+        return 0
     sql = "SELECT * FROM created" + (" WHERE state IN ('', 'open')" if a.open else "") \
         + " ORDER BY created_at DESC, id DESC LIMIT ?"
     for r in con.execute(sql, (a.limit,)):
@@ -60,6 +63,13 @@ def notice_line(r):
 
 def cmd_notice(a):
     con = connect()
+    if a.ncmd == "add":
+        text = sys.stdin.read().strip()
+        if not text:
+            print("brain: notice add needs the text on stdin", file=sys.stderr)
+            return 2
+        print(add_notice(con, a.hook, text, a.session, a.cwd))
+        return 0
     if a.ncmd == "dismiss":
         if not dismiss_notice(con, a.id):
             print(f"no notice {a.id}", file=sys.stderr)

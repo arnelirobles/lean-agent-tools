@@ -1438,6 +1438,55 @@ def run(brain_cli):
                 or con.execute("SELECT branch FROM jobs").fetchone()[0] != "":
             fails.append("a version 9 database must gain the new tables and column, stay at 9 and keep its rows")
         con.close()
+        # The calls lean-agent-tools makes through the brain command.
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "contract.db")
+        rc, out, _ = run("--version")
+        if (rc, out) != (0, "brain 1.0.0"):
+            fails.append(f"--version must print brain 1.0.0: {rc} {out!r}")
+        rc, out, _ = run("list", "--json")
+        if (rc, out) != (0, "[]"):
+            fails.append(f"list --json on an empty database must print []: {rc} {out!r}")
+        run("add", "--project", "p", "--kind", "test-fail", "--ref", "A", "--tag", "zeta", "--tag", "alpha")
+        run("add", "--project", "p", "--kind", "test-fail", "--ref", "B")
+        run("add", "--project", "p", "--kind", "note", "--ref", "C")
+        rc, out, _ = run("list", "--json", "--kind", "test-fail")
+        want_keys = sorted("id kind status project repo branch cycle run_id ref title tags first_seen last_seen".split())
+        try:
+            rows = json.loads(out)
+        except ValueError:
+            rows = []
+        if rc != 0 or len(rows) != 2 or any(sorted(r) != want_keys for r in rows) or rows[0]["tags"] != ["alpha", "zeta"] \
+                or rows[1]["tags"] != []:
+            fails.append(f"list --json must give two objects with the 13 keys and sorted tags: {out!r}")
+        text_ids = [l.split()[0].lstrip("#") for l in run("list", "--kind", "test-fail")[1].splitlines()]
+        if [str(r["id"]) for r in rows] != text_ids or len(json.loads(run("list", "--json")[1])) != 3:
+            fails.append("list --json must keep the rows and order of the text list, and every status without a filter")
+        rc, a, _ = run("notice", "add", "--hook", "h1", stdin="something happened\n")
+        rc2, b, _ = run("notice", "add", "--hook", "h1", stdin="something happened\n")
+        if rc != 0 or rc2 != 0 or not a.isdigit() or a != b:
+            fails.append(f"notice add twice with one hook and text must print one id: {a!r} {b!r}")
+        rc, _, _ = run("notice", "add", "--hook", "h1", stdin="")
+        if rc != 2:
+            fails.append(f"notice add with empty stdin must exit 2: {rc}")
+        args = ("created", "add", "--kind", "pr", "--forge", "github", "--url", "https://example.test/pr/1",
+                "--repo", "o/r", "--number", "1", "--title", "t")
+        rc, a, _ = run(*args)
+        rc2, b, _ = run(*args)
+        if rc != 0 or rc2 != 0 or not a.isdigit() or a != b:
+            fails.append(f"created add twice with one url must print one id: {a!r} {b!r}")
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "infer-json.db")
+        here = os.path.realpath(os.getcwd())
+        rc, out, err = run("session", "infer", "--json")
+        if (rc, json.loads(out or "{}")) != (0, {"id": "", "cwd": ""}) or err:
+            fails.append(f"session infer with no session must print empty ids: {rc} {out!r} {err!r}")
+        run("session", "start", "one-1", "--cwd", here)
+        rc, out, err = run("session", "infer", "--json")
+        if json.loads(out or "{}") != {"id": "one-1", "cwd": here} or err:
+            fails.append(f"session infer must return the one open session of the folder: {out!r} {err!r}")
+        run("session", "start", "two-1", "--cwd", here)
+        rc, out, err = run("session", "infer", "--json")
+        if json.loads(out or "{}") != {"id": "", "cwd": ""} or len(err.splitlines()) != 1:
+            fails.append(f"session infer with two open sessions must print empty ids and one stderr line: {out!r} {err!r}")
         serve_tests(fails, me, d)
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
