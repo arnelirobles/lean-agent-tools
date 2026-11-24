@@ -180,7 +180,16 @@ except ImportError:  # without it no jest package is recognised
     dt = None
 LaneProblem = lr.LaneProblem if lr else type("LaneProblem", (Exception,), {})
 HEAVY = os.path.join(HERE, "heavy.sh")
-BRAIN = os.path.join(HERE, "brain")
+E2E_NOTE = "LEAN_E2E_BRAIN"
+
+
+def brain_e2e_path():
+    """The real brain CLI named by LEAN_E2E_BRAIN, or None. Only the end to end self-test checks use it."""
+    path = os.environ.get(E2E_NOTE)
+    return os.path.abspath(os.path.expanduser(path)) if path else None
+
+
+BRAIN = brain_e2e_path()
 TEST_PHASE = SELF
 BRAIN_TIMEOUT = 5  # every brain call has a limit, so a slow or locked brain cannot hang the drainer
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -3656,6 +3665,24 @@ def self_test():
     got = [n for n, _ in Dotnet.failures('  Failed A.B.T(code: "1 2", e: True) [10 s]\n    Failed = 1,\nFailed!  - Failed: 2\n')]
     if got != ['A.B.T(code: "1 2", e: True)']:
         fails.append(f"vstest line with arguments: {got}")
+    e2e = brain_e2e_path()
+    if e2e:
+        drain_checks(fails, fix, fixture)
+        needs_checks(fails)
+    else:
+        print("skipped: the drain and prerequisite checks that read the real brain (LEAN_E2E_BRAIN is not set)")
+    brainless_checks(fails)
+    go_checks(fails)
+    if fails:
+        print("self-test failed:\n  " + "\n  ".join(fails))
+        return 1
+    print("self-test passed")
+    return 0
+
+
+def drain_checks(fails, fix, fixture):
+    """The drainer against a real brain (LEAN_E2E_BRAIN): what it files, dedups, closes and links. The fake brain does
+    not model occurrence counts, flaky promotion or the list text, so these stay end to end."""
     with tempfile.TemporaryDirectory() as d:
         bin_dir = os.path.join(d, "shims")
         os.mkdir(bin_dir)
@@ -3675,7 +3702,7 @@ for k in kill-once kill-always; do
   fi
 done
 case "$*" in
-  *Canceller.csproj*) python3 "$FAKE_BRAIN" queue cancel "$FAKE_CANCEL" >/dev/null ;;
+  *Canceller.csproj*) "$FAKE_PYTHON" "$FAKE_TP" queue cancel "$FAKE_CANCEL" >/dev/null ;;
 esac
 case "$*" in
   *"--list-tests"*)
@@ -3701,7 +3728,7 @@ if [ -f "$FAKE_DIR/full" ]; then cat "$FAKE_DIR/full"; exit "$(cat "$FAKE_DIR/fu
 echo "Test Run Successful."; echo "Total tests: 1"; echo "     Passed: 1"; exit 0
 ''')
         os.chmod(shim, 0o755)
-        env = dict(os.environ, PATH=bin_dir + os.pathsep + brain_bin(d) + os.pathsep + os.environ["PATH"], FAKE_DIR=d, FAKE_BRAIN=TEST_PHASE,
+        env = dict(os.environ, PATH=bin_dir + os.pathsep + brain_bin(d) + os.pathsep + os.environ["PATH"], FAKE_DIR=d, FAKE_TP=TEST_PHASE, FAKE_PYTHON=sys.executable,
                    FAKE_LOG=os.path.join(d, "calls.log"), LEAN_BRAIN_DB=os.path.join(d, "brain.db"), LEAN_TESTS_DB=os.path.join(d, "tests.db"),
                    HEAVY_LOCK_DIR=os.path.join(d, "locks"), LEAN_TEST_PHASE_DIR=os.path.join(d, "runs"),
                    HEAVY_WAIT="20", TEST_PHASE_REMOTES="off")
@@ -4735,14 +4762,6 @@ exit 0
         if f'"id": {stale}' not in got or f"job #{stale} failed" not in qlist("--cycle", "r7") \
                 or leftovers() != ([], []):
             fails.append(f"a stale remote job needs its host cleaned: {got!r} {qlist('--cycle', 'r7')} {leftovers()}")
-    needs_checks(fails)
-    brainless_checks(fails)
-    go_checks(fails)
-    if fails:
-        print("self-test failed:\n  " + "\n  ".join(fails))
-        return 1
-    print("self-test passed")
-    return 0
 
 
 if __name__ == "__main__":

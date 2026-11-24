@@ -230,10 +230,10 @@ def self_test():
         marker = os.path.join(home, ".local", "share", "lean", "tools-on-path", "abc-123")
         if not os.path.exists(marker) or open(marker).read() != hookkit.TOOLS:
             fails.append("start must leave a marker naming the tools folder for the hooks that never see the env file")
-        shown = subprocess.run(["bash", "-c", f'PATH=/usr/bin:/bin; . {shlex.quote(env_file)}; command -v brain'],
+        shown = subprocess.run(["bash", "-c", f'PATH=/usr/bin:/bin; . {shlex.quote(env_file)}; command -v test-phase'],
                                capture_output=True, text=True).stdout.strip()
-        if shown != os.path.join(hookkit.TOOLS, "brain"):
-            fails.append(f"a shell sourcing the env file must find brain: {shown!r}")
+        if shown != os.path.join(hookkit.TOOLS, "test-phase"):
+            fails.append(f"a shell sourcing the env file must find test-phase: {shown!r}")
         hook("SessionStart")
         hook("SessionStart", raw=json_str({"hook_event_name": "SessionStart", "session_id": "abc-123", "cwd": cwd,
                                            "source": "compact"}))
@@ -256,18 +256,18 @@ def self_test():
         cache = os.path.join(d, "plugins", "cache", "mkt", "lean-agent-tools")
         old_tools = os.path.join(cache, "1.16.0", "tools")
         os.makedirs(old_tools)
-        with open(os.path.join(old_tools, "brain"), "w") as fh:
+        with open(os.path.join(old_tools, "test-phase"), "w") as fh:
             fh.write("#!/bin/sh\necho old\n")
-        os.chmod(os.path.join(old_tools, "brain"), 0o755)
+        os.chmod(os.path.join(old_tools, "test-phase"), 0o755)
         upgraded = os.path.join(d, "upgraded-env")
         with open(upgraded, "w") as fh:
             fh.write(f'export LEAN_SESSION_ID=up-1\nexport PATH="$PATH":{shlex.quote(old_tools)}\n')
         env["CLAUDE_ENV_FILE"] = upgraded
         hook("SessionStart", sid="up-1")
-        wins = subprocess.run(["bash", "-c", f'PATH=/usr/bin:/bin; . {shlex.quote(upgraded)}; command -v brain'],
+        wins = subprocess.run(["bash", "-c", f'PATH=/usr/bin:/bin; . {shlex.quote(upgraded)}; command -v test-phase'],
                               capture_output=True, text=True).stdout.strip()
-        if wins != os.path.join(hookkit.TOOLS, "brain"):
-            fails.append(f"after an upgrade bare brain must run the current version, not {wins!r}: "
+        if wins != os.path.join(hookkit.TOOLS, "test-phase"):
+            fails.append(f"after an upgrade bare test-phase must run the current version, not {wins!r}: "
                          f"{open(upgraded).read()!r}")
         others = [os.path.join(d, "repos", "lean-agent", "tools"), os.path.join(d, "lean-agent", "foo", "tools"),
                   os.path.join(d, "dev", "tools"), os.path.join(d, "plugins", "cache", "lean-agent", "tools")]

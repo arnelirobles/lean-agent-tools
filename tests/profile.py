@@ -239,6 +239,10 @@ RENAMED = [
      "to turn this note off."),
     # lean-agent-tools: log-review.sh moved out of the skills folder
     ("/skills/adversarial-review/log-review.sh", "/tools/log-review.sh"),
+    # task 11: the queue lives in test-phase, brain left the plugin
+    ("brain queue wait ID...", "test-phase queue wait ID..."),
+    ("brain queue add", "test-phase queue add"),
+    ("brain list", "test-phase queue list"),
 ]
 
 

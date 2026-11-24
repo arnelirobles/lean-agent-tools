@@ -24,8 +24,9 @@ jobs:
 
   with-brain:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - run: git clone --depth 1 --branch v1.0.0 https://github.com/arnelirobles/brain.git ../brain
       - run: LEAN_E2E_BRAIN=../brain/tools/brain python3 lib/testq/selftest.py --self-test
+      - run: LEAN_E2E_BRAIN=../brain/tools/brain python3 tools/test-phase --self-test
