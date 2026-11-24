@@ -85,7 +85,8 @@ def copy_from_brain(con, src):
         con.execute("COMMIT")
         return copied
     except BaseException:
-        con.execute("ROLLBACK")
+        if con.in_transaction:
+            con.execute("ROLLBACK")
         raise
     finally:
         if source is not None:
@@ -98,14 +99,22 @@ def connect(timeout=30):
     con = sqlite3.connect(path, timeout=timeout, isolation_level=None)
     con.row_factory = sqlite3.Row
     try:
-        con.execute("BEGIN IMMEDIATE")
-        con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        con.execute(RUNS_DDL)
-        con.execute(JOBS_DDL)
-        con.execute("CREATE INDEX IF NOT EXISTS jobs_status ON jobs (status, id)")
-        con.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
-        con.execute("COMMIT")
-        if not con.execute("SELECT 1 FROM meta WHERE key=?", (MARKER,)).fetchone():
+        def meta(key):
+            try:
+                return con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+            except sqlite3.OperationalError:  # no meta table yet
+                return None
+
+        if not meta("schema_version"):  # a plain read first, so a set up database takes no write lock
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            con.execute(RUNS_DDL)
+            con.execute(JOBS_DDL)
+            con.execute("CREATE INDEX IF NOT EXISTS jobs_status ON jobs (status, id)")
+            con.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
+                        (str(SCHEMA_VERSION),))
+            con.execute("COMMIT")
+        if not meta(MARKER):
             copy_from_brain(con, brain_db_path())
     except BaseException:
         if con.in_transaction:

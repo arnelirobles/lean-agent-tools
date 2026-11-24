@@ -145,6 +145,32 @@ def self_test():
             fails.append("a second connect must not copy again")
         con.close()
 
+        # a brain.db with neither jobs nor runs only writes the marker
+        reset_brain()
+        b = sqlite3.connect(brain)
+        b.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        b.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, project TEXT)")
+        b.commit()
+        b.close()
+        before = sha(brain)
+        fresh_tests_db()
+        con = store.connect()
+        if count(con, "jobs") or count(con, "runs"):
+            fails.append("a brain.db without jobs or runs must copy nothing")
+        if not con.execute("SELECT 1 FROM meta WHERE key='copied_from_brain'").fetchone():
+            fails.append("a brain.db without jobs or runs must still write the marker")
+        con.close()
+        if sha(brain) != before:
+            fails.append("a brain.db without jobs or runs must keep its bytes")
+        # a current tests.db opens again without copying
+        make_brain_late = os.path.join(d, "late.db")
+        make_brain(make_brain_late, 9, [(1, "done")], [1])
+        os.replace(make_brain_late, brain)
+        con = store.connect()
+        if count(con, "jobs") or count(con, "runs"):
+            fails.append("a second connect on a current tests.db must copy nothing")
+        con.close()
+
         # a path with ? and # in it
         odd = os.path.join(d, "odd?x#y")
         os.mkdir(odd)
