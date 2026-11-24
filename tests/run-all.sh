@@ -16,6 +16,7 @@ cd "$root" || exit 2
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/lean-run-all.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 export LEAN_BRAIN_DB="$scratch/brain.db"
+export LEAN_TESTS_DB="$scratch/tests.db"
 # The self-tests assert the strict behaviour; tests/profile.py sets its own profile per case.
 export LEAN_PROFILE=strict
 
@@ -24,7 +25,7 @@ scripts=()
 while IFS= read -r s; do
   [ "$(basename "$s")" = "run-all.sh" ] && continue
   scripts+=("$s")
-done < <(grep -l -- '--self-test' tools/* hooks/*.py lib/*.py lib/brain/web/*.py skills/*/*.sh skills/*/*.py tests/*.py tests/*.sh 2>/dev/null | sort -u)
+done < <(grep -l -- '--self-test' tools/* hooks/*.py lib/*.py lib/brain/web/*.py lib/testq/*.py skills/*/*.sh skills/*/*.py tests/*.py tests/*.sh 2>/dev/null | sort -u)
 if [ "${#scripts[@]}" -eq 0 ]; then
   echo "run-all: found no scripts with a --self-test" >&2
   exit 1
