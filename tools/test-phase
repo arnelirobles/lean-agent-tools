@@ -3111,6 +3111,34 @@ def brainless_checks(fails):
             fails.append(f"a slow brain must time out and not hang the drain ({r.returncode}): {job_states(env)} {r.stderr}")
         not_filed(env, "slow brain")
 
+        # The drain summary names brain only when brain is there; otherwise it names the log folder.
+        def summary(text):
+            return next((ln for ln in text.splitlines() if ln.startswith("test-phase:") and " jobs, " in ln), "")
+
+        output(failing, 1)
+        env, _ = case("sumnone")
+        line = summary(drain(env).stdout)
+        if not line or "brain list" in line or env["LEAN_TEST_PHASE_DIR"] not in line:
+            fails.append(f"with no brain the drain summary must not name brain list and must name the log folder: {line!r}")
+        env, _ = case("sumfake", {})
+        line = summary(drain(env).stdout)
+        if "brain list --open" not in line:
+            fails.append(f"with brain the drain summary must name brain list --open: {line!r}")
+
+        # A 1.x brain.db with live jobs: plain test-phase exits 2 and points at queue import, never "nothing queued".
+        from testq.selftest import make_brain
+        env, _ = case("upgrade")
+        make_brain(env["LEAN_BRAIN_DB"], 9, [(1, "queued"), (2, "running")], [])
+        r = subprocess.run([sys.executable, SELF], env=env, capture_output=True, text=True, timeout=60)
+        if r.returncode != 2 or "queue import" not in r.stderr or "nothing queued" in r.stdout + r.stderr \
+                or r.stderr.count("test-phase: ") != 1 or "Traceback" in r.stderr:
+            fails.append(f"the drainer must exit 2 and name queue import when the copy is refused ({r.returncode}): "
+                         f"{r.stdout!r} {r.stderr!r}")
+        r = subprocess.run([sys.executable, SELF, "--help"], env=env, capture_output=True, text=True, timeout=60)
+        missing = [w for w in ("queue", "run-add", "flaky-clear", "stats") if w not in r.stdout]
+        if r.returncode != 0 or missing:
+            fails.append(f"--help must list the testq subcommands, missing {missing}")
+
 
 def needs_checks(fails):
     """Test prerequisites and environmental runs, on their own brain database and their own fake dotnet."""

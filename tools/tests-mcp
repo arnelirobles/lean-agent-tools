@@ -327,6 +327,10 @@ def self_test():
             if res.get("protocolVersion") != "2025-03-26" or res.get("serverInfo", {}).get("name") != "tests" \
                     or "tools" not in res.get("capabilities", {}):
                 fails.append(f"initialize: {r}")
+            with open(os.path.join(HERE, "..", ".claude-plugin", "plugin.json")) as pj:
+                plugin_version = json.load(pj)["version"]
+            if res.get("serverInfo", {}).get("version") != plugin_version:
+                fails.append(f"serverInfo version must be the plugin's {plugin_version}: {res.get('serverInfo')}")
             p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
             p.stdin.flush()
             if rpc("ping").get("result") != {}:

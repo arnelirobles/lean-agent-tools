@@ -405,6 +405,71 @@ def refused_checks(fails, d):
                 fails.append(f"{argv[0]} while the copy is refused must exit 2 with the message: {rc} {err!r}")
 
 
+def upgrade_checks(fails, d):
+    """The way out for a 1.x upgrader: queue import, with and without --cancel-live, and a newer tests.db."""
+    live = os.path.join(d, "up-live.db")
+    make_brain(live, 9, [(1, "queued"), (2, "running")], [])
+    os.environ["LEAN_BRAIN_DB"] = live
+    tests = os.path.join(d, "up-live-tests.db")
+    os.environ["LEAN_TESTS_DB"] = tests
+    with isolated(d, "up-live"):
+        rc, out, err = run("queue", "import")
+        if rc != 2 or len(err.splitlines()) != 1 or err.count("test-phase: ") != 1 or "--cancel-live" not in err:
+            fails.append(f"queue import with live jobs must exit 2 with one line naming --cancel-live: {rc} {err!r}")
+        chk = sqlite3.connect(tests)
+        left = chk.execute("SELECT (SELECT COUNT(*) FROM jobs), (SELECT COUNT(*) FROM meta WHERE key=?)",
+                           (store.MARKER,)).fetchone()
+        chk.close()
+        if tuple(left) != (0, 0):
+            fails.append(f"a refused queue import must leave no jobs and no marker: {tuple(left)}")
+        before = sha(live)
+        rc, out, err = run("queue", "import", "--cancel-live")
+        if rc != 0:
+            fails.append(f"queue import --cancel-live must exit 0: {rc} {err!r}")
+        chk = sqlite3.connect(tests)
+        rows = chk.execute("SELECT status, reason, ended_at FROM jobs ORDER BY id").fetchall()
+        marker = chk.execute("SELECT COUNT(*) FROM meta WHERE key=?", (store.MARKER,)).fetchone()[0]
+        chk.close()
+        if len(rows) != 2 or any(r[0] != "cancelled" or r[1] != "queued under 1.x, not run" or not r[2] for r in rows):
+            fails.append(f"--cancel-live must copy both jobs as cancelled with the reason and ended_at: {rows}")
+        if marker != 1:
+            fails.append("--cancel-live must set the marker")
+        if sha(live) != before:
+            fails.append("--cancel-live must never write brain.db")
+        rc, out, err = run("queue", "list")
+        if rc != 0:
+            fails.append(f"queue list after --cancel-live must exit 0: {rc} {err!r}")
+
+    done = os.path.join(d, "up-done.db")
+    make_brain(done, 9, [(1, "done"), (2, "failed")], [1, 2])
+    os.environ["LEAN_BRAIN_DB"] = done
+    tests = os.path.join(d, "up-done-tests.db")
+    os.environ["LEAN_TESTS_DB"] = tests
+    with isolated(d, "up-done"):
+        rc, out, err = run("queue", "import")
+        con = sqlite3.connect(tests)
+        copied = con.execute("SELECT (SELECT COUNT(*) FROM jobs), (SELECT COUNT(*) FROM runs)").fetchone()
+        con.close()
+        if rc != 0 or tuple(copied) != (2, 2):
+            fails.append(f"queue import with only finished jobs must copy them and exit 0: {rc} {tuple(copied)} {err!r}")
+        rc, out, err = run("queue", "import")
+        if rc != 0 or err:
+            fails.append(f"a second queue import must exit 0 quietly: {rc} {err!r}")
+
+    newer = os.path.join(d, "up-newer-tests.db")
+    con = sqlite3.connect(newer)
+    con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    con.execute("INSERT INTO meta VALUES ('schema_version', '2')")
+    con.commit()
+    con.close()
+    os.environ["LEAN_BRAIN_DB"] = os.path.join(d, "up-none.db")
+    os.environ["LEAN_TESTS_DB"] = newer
+    with isolated(d, "up-newer"):
+        rc, out, err = run("queue", "list")
+        if rc != 2 or len(err.splitlines()) != 1 or "schema" not in err or "Traceback" in err:
+            fails.append(f"a newer tests.db schema must exit 2 with one line naming the schema: {rc} {err!r}")
+
+
 DOTNET_SHIM = ('#!/bin/sh\necho "$*" >> "$FAKE_LOG"\n[ "$1" = build ] && exit 0\n'
                'f="$FAKE_DIR/out-$(basename "$2")"\ncat "$f"\nexit "$(cat "$f.rc")"\n')
 TEST_PHASE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -621,7 +686,8 @@ def self_test():
             fails.append("after the jobs are done the next connect must copy")
         con.close()
 
-        for checks in (queue_checks, session_checks, flaky_checks, stats_checks, refused_checks, e2e_brain_checks):
+        for checks in (queue_checks, session_checks, flaky_checks, stats_checks, refused_checks, upgrade_checks,
+                       e2e_brain_checks):
             checks(fails, d)
     os.environ.clear()
     os.environ.update(saved_env)
