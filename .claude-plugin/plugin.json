@@ -12,6 +12,9 @@
   "mcpServers": {
     "brain": {
       "command": "${CLAUDE_PLUGIN_ROOT}/tools/brain-mcp"
+    },
+    "tests": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/tools/tests-mcp"
     }
   },
   "userConfig": {
