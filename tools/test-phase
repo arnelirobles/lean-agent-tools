@@ -3657,23 +3657,23 @@ def self_test():
     if "Server=db" not in masked or "User=x" not in masked:
         fails.append(f"masking removed more than the secret: {masked!r}")
     seen = {}
-    real_brain = globals()["brain"]
-    globals()["brain"] = lambda args, stdin=None: seen.update(args=args, stdin=stdin)
+    real_brain = globals()["brain_status"]
+    globals()["brain_status"] = lambda args, stdin=None: (seen.update(args=args, stdin=stdin), ("1", None))[1]
     try:
         add_item({"project": "p"}, "test-fail", "T.a", "important", probe, None,
                  {"repo": "r", "cycle": "c", "branch": ""})
     finally:
-        globals()["brain"] = real_brain
+        globals()["brain_status"] = real_brain
     if FAKE_PW in " ".join(seen.get("args", [])) or FAKE_PW in (seen.get("stdin") or "") \
             or "-" not in seen.get("args", []) or "--body" in seen.get("args", []):
         fails.append(f"item body must be masked and sent by stdin, not argv: {seen}")
 
-    globals()["brain"] = lambda args, stdin=None: seen.update(args=args, stdin=stdin)
+    globals()["brain_status"] = lambda args, stdin=None: (seen.update(args=args, stdin=stdin), ("1", None))[1]
     try:
         add_item({"project": "p", "session": "s-1", "session_cwd": "/w"}, "flaky", "T.b", "minor", "x", None,
                  {"repo": "r", "cycle": "c", "branch": ""})
     finally:
-        globals()["brain"] = real_brain
+        globals()["brain_status"] = real_brain
     a = seen.get("args", [])
     if "--session" not in a or a[a.index("--session") + 1] != "s-1":
         fails.append(f"an item must carry the session that queued the job: {a}")
