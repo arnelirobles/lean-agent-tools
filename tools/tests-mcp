@@ -397,6 +397,11 @@ def self_test():
                 err, text = call("queue_add", **bad)
                 if not err:
                     fails.append(f"queue_add must refuse {bad}: {text!r}")
+            for nul in ({"repo_dir": "a\0b", "test_project": "t"}, {"repo_dir": repo, "test_project": "t\0x"},
+                        {"repo_dir": repo, "test_project": "t", "again": "a\0b"}):
+                err, text = call("queue_add", **nul)
+                if not err or not text or "internal error" in text:
+                    fails.append(f"C5: a null byte in {nul} must be a readable isError, not an internal error: {err} {text!r}")
             err, text = call("queue_route", id=1, to="remote")
             if err or "platform=remote" not in text:
                 fails.append(f"queue_route must send a queued job to a remote lane: {err} {text!r}")
