@@ -201,7 +201,7 @@ def self_test():
         if [ln for ln in nl_lines if "LEAN_SESSION_CWD" in ln] or \
                 [ln for ln in nl_lines if ln != mine and not ln.startswith("export LEAN_SESSION_ID=")]:
             fails.append(f"a cwd with a newline must write no cwd line and leave only expected lines: {nl_lines!r}")
-        if brain_out("session", "status", "nl-1") != "open ":
+        if brain_out("session", "status", "nl-1") != "open":
             fails.append("a cwd with a newline must be stored as an empty cwd")
         env["CLAUDE_ENV_FILE"] = env_file
 
