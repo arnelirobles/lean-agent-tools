@@ -6,6 +6,7 @@ as one JSON line to $FAKE_BRAIN_LOG. Environment:
   FAKE_BRAIN_SLEEP    seconds to sleep before any call except --version
   FAKE_BRAIN_VERSION_SLEEP  seconds to sleep before answering --version (a slow probe)
   FAKE_BRAIN_RAW      printed verbatim by `list --json` instead of the items
+  FAKE_BRAIN_STDIN_LOG  file that gets each unmodelled call's stdin as one JSON string per line
 Modeled: --version, add, list --json, close, session infer --json. Any other subcommand reads stdin,
 logs argv, prints a fresh integer id and exits 0.
 """
@@ -117,7 +118,11 @@ def main(argv, stdin=None):
     if argv[:2] == ["session", "infer"] and "--json" in argv:
         print(json.dumps({"id": "fake-session", "cwd": os.getcwd()}))
         return 0
-    (stdin or sys.stdin).read()
+    text = (stdin or sys.stdin).read()
+    stdin_log = env.get("FAKE_BRAIN_STDIN_LOG")
+    if stdin_log:
+        with open(stdin_log, "a") as f:
+            f.write(json.dumps(text) + "\n")
     print(_fresh_id(state))
     _save(path, state)
     return 0
