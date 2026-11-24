@@ -14,8 +14,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import brainlink  # noqa: E402
 from testq import cli, fakebrain, queue as tq, store  # noqa: E402
 
-# Literal DDL copied from lib/brain/store.py (migrations 2, 3, 4, 6, 7, 8, 9 and the branch column of
-# ensure_extras). The self-test never imports lib/brain.
+# Literal DDL copied from brain's store.py (migrations 2, 3, 4, 6, 7, 8, 9 and the branch column of
+# ensure_extras). The self-test never imports brain's code.
 RUNS_V4 = """CREATE TABLE runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, cycle TEXT NOT NULL DEFAULT '', project TEXT NOT NULL,
     repo TEXT NOT NULL DEFAULT '', test_project TEXT NOT NULL DEFAULT '', runner TEXT NOT NULL DEFAULT '',
@@ -405,6 +405,70 @@ def refused_checks(fails, d):
                 fails.append(f"{argv[0]} while the copy is refused must exit 2 with the message: {rc} {err!r}")
 
 
+DOTNET_SHIM = ('#!/bin/sh\necho "$*" >> "$FAKE_LOG"\n[ "$1" = build ] && exit 0\n'
+               'f="$FAKE_DIR/out-$(basename "$2")"\ncat "$f"\nexit "$(cat "$f.rc")"\n')
+TEST_PHASE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                          "tools", "test-phase")
+
+
+def e2e_brain_checks(fails, d):
+    """One drain against the real brain named by LEAN_E2E_BRAIN. Unset, the check is skipped with a line."""
+    path = os.environ.get("LEAN_E2E_BRAIN")
+    if not path:
+        print("skipped: the end to end drain against a real brain (LEAN_E2E_BRAIN is not set)")
+        return
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(path):
+        fails.append(f"LEAN_E2E_BRAIN names a file that does not exist: {path}")
+        return
+    base = os.path.join(d, "e2e")
+    shims, bin_dir, home = (os.path.join(base, n) for n in ("shims", "bin", "home"))
+    for folder in (shims, bin_dir, home, os.path.join(base, "repo", "tests", "T")):
+        os.makedirs(folder)
+    with open(os.path.join(shims, "dotnet"), "w") as fh:
+        fh.write(DOTNET_SHIM)
+    os.chmod(os.path.join(shims, "dotnet"), 0o755)
+    os.symlink(path, os.path.join(bin_dir, "brain"))
+    tools = os.path.join(base, "tools")
+    os.makedirs(tools)
+    for where in os.environ.get("PATH", "").split(os.pathsep):
+        try:
+            names = os.listdir(where) if where and not where.startswith(base) else []
+        except OSError:
+            continue
+        for name in names:
+            full, link = os.path.join(where, name), os.path.join(tools, name)
+            if name != "brain" and not os.path.lexists(link) and os.path.isfile(full) and os.access(full, os.X_OK):
+                os.symlink(full, link)
+    with open(os.path.join(base, "out-Fx.csproj"), "w") as fh:
+        fh.write("  Failed Fx.Tests.Breaks [1 ms]\n   Assert.Equal() Failure\n"
+                 "Failed!  - Failed: 1, Passed: 0, Skipped: 0, Total: 1\n")
+    with open(os.path.join(base, "out-Fx.csproj.rc"), "w") as fh:
+        fh.write("1")
+    plan = os.path.join(base, "plan.txt")
+    with open(plan, "w") as fh:
+        fh.write(f"{os.path.join(base, 'repo')} tests/T/Fx.csproj\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("FAKE_BRAIN", "LEAN_E2E"))}
+    env.update(PATH=os.pathsep.join([shims, bin_dir, tools]), HOME=home, FAKE_DIR=base,
+               FAKE_LOG=os.path.join(base, "calls.log"), LEAN_BRAIN_DB=os.path.join(base, "brain.db"),
+               LEAN_TESTS_DB=os.path.join(base, "tests.db"), LEAN_DB=os.path.join(base, "lean.db"),
+               HEAVY_LOCK_DIR=os.path.join(base, "locks"), LEAN_TEST_PHASE_DIR=os.path.join(base, "runs"),
+               HEAVY_WAIT="20", TEST_PHASE_REMOTES="off")
+    env.pop("TEST_PHASE_RUNNER", None)
+    r = subprocess.run([sys.executable, TEST_PHASE, plan], env=env, capture_output=True, text=True, timeout=240)
+    if r.returncode != 1 or "Traceback" in r.stdout + r.stderr:
+        fails.append(f"e2e drain of a failing job must exit 1 with no traceback ({r.returncode}): {r.stdout} {r.stderr}")
+    listed = subprocess.run([sys.executable, path, "list", "--json", "--kind", "test-fail"], env=env,
+                            capture_output=True, text=True, timeout=60)
+    try:
+        items = json.loads(listed.stdout)
+    except ValueError:
+        items = None
+    if not isinstance(items, list) or len(items) != 1 or "Fx.Tests.Breaks" not in json.dumps(items[0]):
+        fails.append(f"brain list --json --kind test-fail must show the failure the drain filed: "
+                     f"{listed.stdout!r} {listed.stderr!r}")
+
+
 def self_test():
     fails = []
     saved_env = dict(os.environ)
@@ -557,7 +621,7 @@ def self_test():
             fails.append("after the jobs are done the next connect must copy")
         con.close()
 
-        for checks in (queue_checks, session_checks, flaky_checks, stats_checks, refused_checks):
+        for checks in (queue_checks, session_checks, flaky_checks, stats_checks, refused_checks, e2e_brain_checks):
             checks(fails, d)
     os.environ.clear()
     os.environ.update(saved_env)

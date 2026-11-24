@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Gradle arguments a test job may pass, shared by test-phase and the brain queue.
+"""The Gradle arguments a test job may pass, shared by test-phase and its queue.
 
 A job's args= may hold task names and a short list of options. Anything else is refused: an option that sets a
 property, adds a build, a settings file, an init script or another Gradle home could hand a credential to the

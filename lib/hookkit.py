@@ -1866,11 +1866,11 @@ def self_test():
         os.environ["PATH"] = "/usr/bin"
         os.environ["HOME"] = home
         _state.event = {}
-        check("tool_path is absolute and exists", (os.path.isabs(tool_path("brain")), os.path.exists(TOOLS + "/brain")), (True, True))
+        check("tool_path is absolute and exists", (os.path.isabs(tool_path("test-phase")), os.path.exists(TOOLS + "/test-phase")), (True, True))
         os.environ["CLAUDE_ENV_FILE"] = os.path.join(home, "no-such-dir", "env")  # session-env cannot write it
         _state.event = {"hook_event_name": "SessionStart", "session_id": "m-1"}
         check("SessionStart with an unwritable env file and no marker gives the absolute path",
-              tool_path("brain"), shlex.quote(os.path.join(TOOLS, "brain")))
+              tool_path("test-phase"), shlex.quote(os.path.join(TOOLS, "test-phase")))
         _state.event = {"hook_event_name": "PreToolUse", "session_id": "m-1"}
         check("CLAUDE_ENV_FILE alone does not count outside SessionStart", tools_on_path(), False)
         os.environ.pop("CLAUDE_ENV_FILE")
@@ -1878,17 +1878,17 @@ def self_test():
         os.makedirs(os.path.dirname(marker))
         with open(marker, "w") as fh:
             fh.write(TOOLS)
-        check("the session's marker puts the tools on PATH", tool_path("brain"), "brain")
+        check("the session's marker puts the tools on PATH", tool_path("test-phase"), "test-phase")
         _state.event = {"hook_event_name": "PreToolUse", "session_id": "m-2"}
-        check("another session has no marker", tool_path("brain").startswith("/"), True)
+        check("another session has no marker", tool_path("test-phase").startswith("/"), True)
         with open(marker, "w") as fh:
             fh.write("/old/tools")
         _state.event = {"hook_event_name": "PreToolUse", "session_id": "m-1"}
         check("a marker for another folder does not count", tools_on_path(), False)
         _state.event = {}
         os.environ["PATH"] = "/usr/bin" + os.pathsep + TOOLS
-        check("tool_path is the bare name when PATH names the tools", tool_path("brain"), "brain")
-        check("tool_path with a base stays a path", tool_path("brain", "/a/tools"), "/a/tools/brain")
+        check("tool_path is the bare name when PATH names the tools", tool_path("test-phase"), "test-phase")
+        check("tool_path with a base stays a path", tool_path("test-phase", "/a/tools"), "/a/tools/test-phase")
     finally:
         _state.event = saved_event
         shutil.rmtree(home, True)
@@ -1897,8 +1897,8 @@ def self_test():
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-    check("tool_path quotes a path with a space", tool_path("brain", "/a b/tools"), "'/a b/tools/brain'")
-    check("tool_path leaves a plain path bare", tool_path("brain", "/a/tools"), "/a/tools/brain")
+    check("tool_path quotes a path with a space", tool_path("test-phase", "/a b/tools"), "'/a b/tools/test-phase'")
+    check("tool_path leaves a plain path bare", tool_path("test-phase", "/a/tools"), "/a/tools/test-phase")
 
     import subprocess
     import time

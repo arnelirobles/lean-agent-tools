@@ -22,7 +22,7 @@ METHOD = "skills/tools/SKILL.md"
 BLOCK_HEADING = "## Scripts\n"
 
 # Not commands an agent runs: the MCP server entry point and a shared module.
-NOT_COMMANDS = {"brain-mcp", "tests-mcp", "lean_remote.py"}
+NOT_COMMANDS = {"tests-mcp", "lean_remote.py"}
 
 PATH_PATTERNS = [
     re.compile(r"\$\{?CLAUDE_PLUGIN_ROOT\}?\"?/bin/"),

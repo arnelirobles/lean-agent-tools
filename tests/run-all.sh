@@ -25,7 +25,7 @@ scripts=()
 while IFS= read -r s; do
   [ "$(basename "$s")" = "run-all.sh" ] && continue
   scripts+=("$s")
-done < <(grep -l -- '--self-test' tools/* hooks/*.py lib/*.py lib/brain/web/*.py lib/testq/*.py skills/*/*.sh skills/*/*.py tests/*.py tests/*.sh 2>/dev/null | sort -u)
+done < <(grep -l -- '--self-test' tools/* hooks/*.py lib/*.py lib/testq/*.py skills/*/*.sh skills/*/*.py tests/*.py tests/*.sh 2>/dev/null | sort -u)
 if [ "${#scripts[@]}" -eq 0 ]; then
   echo "run-all: found no scripts with a --self-test" >&2
   exit 1

@@ -3,7 +3,7 @@
 
   tests/profile.py --self-test
 
-a. No hook ends a call with a bare exit 2 outside hookkit.refuse, and every hook runs through hookkit.run (a hook that imports lib/brain/hooks.py, bh.run).
+a. No hook ends a call with a bare exit 2 outside hookkit.refuse, and every hook runs through hookkit.run.
 b. LEAN_PROFILE=off: every hooks.json command exits 0 with no output and writes nothing.
 c. LEAN_PROFILE unset: the owner's checks do not refuse a stranger, a key in a Write still does.
 d. LEAN_PROFILE=strict (and an unknown value): the hook from origin/main and the current hook give the
@@ -89,8 +89,7 @@ def part_a():
     names = {os.path.basename(c.split('"')[-2] if '"' in c else c.split()[-1]) for c in hook_commands()}
     for name in sorted(names):
         source = open(os.path.join(ROOT, "hooks", name)).read()
-        runner = "bh.run(main)" if "from brain import hooks as bh" in source else "hookkit.run(main)"
-        check(f"{name} ends in {runner}", source.rstrip().endswith(runner), True)
+        check(f"{name} ends in hookkit.run(main)", source.rstrip().endswith("hookkit.run(main)"), True)
 
 
 def part_b():

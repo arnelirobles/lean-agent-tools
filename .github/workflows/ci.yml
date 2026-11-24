@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      - name: brain is not installed on this runner
+        run: "! command -v brain"
       - uses: actions/checkout@v4
         with:
           # run-all.sh compares against the current version's tag, so it needs the tags.
@@ -20,19 +22,10 @@ jobs:
       - run: git config --global user.email ci@example.com && git config --global user.name ci
       - run: bash tests/run-all.sh
 
-  extension:
+  with-brain:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    defaults:
-      run:
-        working-directory: vscode
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: vscode/package-lock.json
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npx vitest run
+      - run: git clone --depth 1 --branch v1.0.0 https://github.com/arnelirobles/brain.git ../brain
+      - run: LEAN_E2E_BRAIN=../brain/tools/brain python3 lib/testq/selftest.py --self-test

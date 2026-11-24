@@ -8,7 +8,7 @@ PreToolUse hook on Bash. It adds a note, never a deny, in two cases:
     <version>/tools/ path (or the older bin/ one): the versioned path breaks after an upgrade, use
     the absolute tools path. Once per session.
 It also blocks (exit 2) a command that runs dotnet test, npx vitest, vitest run or npm test
-directly: tests run through `brain queue add` and test-phase. A command that only mentions the
+directly: tests run through `test-phase queue add`. A command that only mentions the
 words (quoted, a heredoc body) passes, and so does one that names test-phase, heavy.sh or
 brain queue.
 A family whose covering script is a hook (wait-loop, pgrep) gets no note here, nor does
@@ -134,7 +134,7 @@ def block_message(cwd):
     return ("Do not run tests directly. Queue them: `%s queue add %s <test project> --filter ...`, then end "
             "the turn; the orchestrator runs `%s`. If it cannot run here, `%s --doctor` shows what is missing. "
             "LEAN_DIRECT_TEST=on turns this block off." % (
-                hookkit.tool_path("brain"), cwd, hookkit.tool_path("test-phase"), hookkit.tool_path("test-phase")))
+                hookkit.tool_path("test-phase"), cwd, hookkit.tool_path("test-phase"), hookkit.tool_path("test-phase")))
 
 
 def state_dir():
@@ -359,7 +359,7 @@ def self_test():
                            ("after cd", "cd app && dotnet test | tail -5"),
                            ("env prefix", "CI=1 npm test"), ("after a note", "echo hi; npx vitest")):
         rc, text, err = fire(command, "dt-" + label.replace(" ", "-"))
-        check("block " + label, rc == 2 and text == "" and "brain" in err and "queue add" in err
+        check("block " + label, rc == 2 and text == "" and "test-phase queue add" in err
               and "test-phase --doctor" in err and "LEAN_DIRECT_TEST=on turns this block off" in err, repr((rc, err)))
     rc, _, _ = fire("dotnet test X", "dt-again")
     rc2, _, _ = fire("dotnet test X", "dt-again")
@@ -367,7 +367,8 @@ def self_test():
     for label, command in (("test-phase", "tools/test-phase run -- dotnet test X"),
                            ("heavy.sh lane", "bash tools/heavy.sh dotnet dotnet test X.sln"),
                            ("heavy.sh node", "HEAVY_WAIT=60 bash /p/tools/heavy.sh node npm test"),
-                           ("queue add", "brain queue add r p --filter A"),
+                           ("queue add", "test-phase queue add r p --filter A"),
+                           ("old queue add", "brain queue add r p --filter A"),
                            ("commit message", 'git commit -m "wire dotnet test into npm test"'),
                            ("grep", "grep 'dotnet test' README.md"),
                            ("heredoc body", "cat > notes.md <<'EOF'\nrun npx vitest\ndotnet test X\nEOF"),

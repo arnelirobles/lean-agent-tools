@@ -8,8 +8,8 @@
     {
       "name": "lean-agent-tools",
       "source": "./",
-      "description": "Hooks, brain, scripted gates and test tools for the lean-agent skills."
+      "description": "Hooks, gates and the test queue for the lean-agent skills."
     }
   ],
-  "description": "Hooks, brain, gates and test tools for the lean-agent skills plugin."
+  "description": "Hooks, gates, the test queue and test tools for the lean-agent skills plugin."
 }
