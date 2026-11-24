@@ -3,9 +3,8 @@ import os
 import statistics
 import time
 
-from .store import connect, db_path, epoch
+from .store import connect, db_path, epoch, project_of
 from .items import tags_of
-from .queue import job_line, project_of
 
 
 RESUME_ORDER = ("blocker", "agent", "pending", "question")
@@ -25,9 +24,7 @@ def cmd_resume(a):
     con = connect()
     rows = con.execute("SELECT id, kind, title, ref FROM items WHERE status='open' AND project=?"
                        " ORDER BY id DESC", (project,)).fetchall()
-    jobs = con.execute("SELECT * FROM jobs WHERE status IN ('queued', 'running') AND project=? ORDER BY id",
-                       (project,)).fetchall()
-    if not rows and not jobs:
+    if not rows:
         return 0
 
     def rank(r):
@@ -38,12 +35,10 @@ def cmd_resume(a):
     for r in rows:
         title = " ".join((r["title"] or r["ref"]).split())
         lines.append((rank(r), f"#{r['id']} {r['kind']} {title[:100]}"))
-    at = sum(1 for k, _ in lines if k <= RESUME_ORDER.index("agent"))  # jobs follow blockers and agents
-    lines[at:at] = [(1, job_line(j)[:100]) for j in jobs]
     total = len(lines)
     room = max(a.max, 2) - 2  # the header and the line for what was cut
     shown = lines if total <= room + 1 else lines[:room]
-    print(f"brain: {len(rows)} open and {len(jobs)} queued or running for {project}")
+    print(f"brain: {len(rows)} open for {project}")
     for _, text in shown:
         print(text)
     if len(shown) < total:
@@ -68,8 +63,8 @@ def stale_cutoff():
 
 def digest_lines(con, project, recover=False):
     """The digest as lines. project None means all of them; it matches without regard to case.
-    Running jobs, queued count and stale agents come before the blockers and questions, which are cut first.
-    With recover the queued count and the blockers and questions are left to recover_lines."""
+    Stale agents come before the blockers and questions, which are cut first.
+    With recover the blockers and questions are left to recover_lines."""
     where, args = "", []
     if project:
         where, args = " AND lower(project)=lower(?)", [project]
@@ -83,14 +78,6 @@ def digest_lines(con, project, recover=False):
         lines.append(f"{p}: " + ", ".join(kinds[:8]) + (f", +{len(kinds) - 8} kinds" if len(kinds) > 8 else ""))
     if len(counts) > len(shown):
         lines.append(f"+{len(counts) - len(shown)} more projects")
-    jobs = con.execute("SELECT * FROM jobs WHERE status='running'" + where + " ORDER BY id", args).fetchall()
-    for j in jobs[:DIGEST_LIST]:
-        lines.append(short(job_line(j), 110))
-    if len(jobs) > DIGEST_LIST:
-        lines.append(f"+{len(jobs) - DIGEST_LIST} more running jobs")
-    queued = con.execute("SELECT COUNT(*) FROM jobs WHERE status='queued'" + where, args).fetchone()[0]
-    if queued and not recover:
-        lines.append(f"{queued} queued jobs")
     rows = con.execute("SELECT id, project, title, ref, last_seen FROM items WHERE status='open' AND kind='agent'"
                        " AND last_seen < ?" + where + " ORDER BY last_seen", [stale_cutoff()] + args).fetchall()
     for r in rows[:DIGEST_LIST]:
@@ -113,7 +100,7 @@ def digest_lines(con, project, recover=False):
 
 def recover_lines(con, project):
     """What a session needs after a compaction, most important first: every open blocker, the agents the digest
-    did not list as stale, queued jobs, pending steps, questions."""
+    did not list as stale, pending steps, questions."""
     where, args = " AND lower(project)=lower(?)", [project]
 
     def items(kind, extra="", more=()):
@@ -123,8 +110,6 @@ def recover_lines(con, project):
 
     lines = items("blocker")
     lines += items("agent", " AND last_seen >= ?", [stale_cutoff()])
-    lines += [job_line(j)[:110] for j in con.execute("SELECT * FROM jobs WHERE status='queued'" + where
-                                                    + " ORDER BY priority DESC, id", args)]
     return lines + items("pending") + items("question")
 
 
@@ -177,17 +162,6 @@ def stats(con):
         "SELECT id, project, title, last_seen FROM items WHERE kind='agent' AND status='open' AND last_seen < ?"
         " ORDER BY last_seen, id", (cutoff,))]
     out["median_close_s"] = {k: statistics.median(v) for k, v in sorted(spans.items())}
-    out["suites"] = [dict(r) for r in con.execute(
-        "SELECT r.project, r.test_project, COUNT(*) AS runs, ROUND(AVG(r.lane_wait_s), 1) AS mean_lane_wait_s,"
-        " ROUND(AVG(r.duration_s), 1) AS mean_duration_s,"
-        " (SELECT COUNT(*) FROM items i JOIN runs rr ON rr.id = i.run_id WHERE i.kind='flaky'"
-        "  AND rr.project = r.project AND rr.test_project = r.test_project) AS flaky_items"
-        " FROM runs r WHERE r.tier != 'rerun' GROUP BY r.project, r.test_project ORDER BY r.project, r.test_project")]
-    for s in out["suites"]:
-        s["flaky_rate"] = round(s["flaky_items"] / s["runs"], 3) if s["runs"] else 0
-    out["slowest"] = [dict(r) for r in con.execute(
-        "SELECT id, project, test_project, tier, duration_s FROM runs WHERE duration_s IS NOT NULL"
-        " ORDER BY duration_s DESC, id LIMIT 5")]
     return out
 
 
@@ -212,13 +186,6 @@ def cmd_stats(a):
                    [[r["id"], r["project"], r["last_seen"], r["title"][:60]] for r in s["stale_agents"]]))
     print("\nmedian time to close")
     print(grid(["kind", "hours"], [[k, round(v / 3600, 2)] for k, v in s["median_close_s"].items()]))
-    print("\nsuites (fast and full runs)")
-    print(grid(["project", "test project", "runs", "flaky items", "flaky rate", "mean lane wait s", "mean duration s"],
-               [[r["project"], r["test_project"], r["runs"], r["flaky_items"], r["flaky_rate"],
-                 r["mean_lane_wait_s"], r["mean_duration_s"]] for r in s["suites"]]))
-    print("\nslowest runs")
-    print(grid(["run", "project", "test project", "tier", "duration s"],
-               [[r["id"], r["project"], r["test_project"], r["tier"], r["duration_s"]] for r in s["slowest"]]))
     return 0
 
 

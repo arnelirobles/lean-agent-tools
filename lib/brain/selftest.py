@@ -5,8 +5,7 @@ import sys
 import tempfile
 import time
 
-from .store import KIND, MIGRATIONS, connect, migrate_1
-from .queue import detect_platform, project_of
+from .store import KIND, MIGRATIONS, connect, migrate_1, project_of
 from . import records
 
 
@@ -16,7 +15,7 @@ DIGEST_MAX = 2048
 def digest_tests(fails, me, d):
     import sqlite3
     db = os.path.join(d, "digest.db")
-    env = dict(os.environ, LEAN_BRAIN_DB=db)
+    env = dict(os.environ, LEAN_BRAIN_DB=db, LEAN_TESTS_DB=db + ".tests")
     env.pop("LEAN_SESSION_ID", None)
     env.pop("LEAN_SESSION_CWD", None)
     repo = os.path.join(d, "demo")
@@ -48,12 +47,6 @@ def digest_tests(fails, me, d):
     rows += [("Bulk%d" % (i % 40), "test-fail", "t%d" % i, "title " + "x" * 80, "open", now) for i in range(2000)]
     con.executemany("INSERT INTO items (project, kind, ref, title, status, first_seen, last_seen) "
                     "VALUES (?,?,?,?,?,?,?)", [r + (r[5],) for r in rows])
-    con.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) "
-                "VALUES ('Demo', '/x', 't/A.csproj', 'running', ?)", (now,))
-    con.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) "
-                "VALUES ('demo', '/x', 't/B.csproj', 'done', ?)", (now,))
-    con.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) "
-                "VALUES ('DEMO', '/x', 't/Q.csproj', 'queued', ?)", (now,))
     rows = [("deep", "blocker", "d%d" % i, "deep blocker %d" % i, "open", now, now) for i in range(10)]
     rows += [("wide", k, "w%s%d" % (k, i), "wide %s %d %s" % (k, i, "y" * 80), "open", old if k == "agent" else now,
               old if k == "agent" else now) for k in ("blocker", "question", "agent") for i in range(8)]
@@ -68,16 +61,13 @@ def digest_tests(fails, me, d):
         fails.append(f"digest of the current project must not show other projects: {out!r}")
     if "stale agent here" not in out or "fresh agent here" in out or "closed old agent" in out:
         fails.append(f"digest must show only open agents older than 24 hours as stale: {out!r}")
-    if "t/A.csproj" not in out or "t/B.csproj" in out:
-        fails.append(f"digest must show running jobs only: {out!r}")
     if "demo:" not in out or "blocker 1" not in out:
         fails.append(f"digest must count by project and kind, with the project in one case: {out!r}")
-    if "1 queued jobs" not in out or "t/Q.csproj" in out:
-        fails.append(f"digest counts queued jobs without listing them: {out!r}")
+    if "job #" in out or "queued" in out or "running" in out:
+        fails.append(f"digest must print no job lines: {out!r}")
     rc, rec = brain("digest", "--recover", cwd=repo)
-    if "job #" not in rec or "t/Q.csproj" not in rec or "queued jobs" in rec or rec.count("stale agent here") != 1 \
-            or "fresh agent here" not in rec:
-        fails.append(f"--recover must list queued jobs and open agents once, not repeat the digest: {rec!r}")
+    if "job #" in rec or rec.count("stale agent here") != 1 or "fresh agent here" not in rec:
+        fails.append(f"--recover must list open agents once, not repeat the digest, and no jobs: {rec!r}")
     rc, rec = brain("digest", "--project", "deep", "--recover")
     plain = brain("digest", "--project", "deep")[1]
     if "deep blocker 0" not in rec or "deep blocker 9" not in rec or "deep blocker 0" in plain:
@@ -111,7 +101,7 @@ def serve_tests(fails, me, d):
     import threading
     from . import cli
     home = os.path.join(d, "home")
-    env = dict(os.environ, LEAN_BRAIN_DB=os.path.join(d, "serve.db"), HOME=home, USERPROFILE=home,
+    env = dict(os.environ, LEAN_BRAIN_DB=os.path.join(d, "serve.db"), LEAN_TESTS_DB=os.path.join(d, "serve-tests.db"), HOME=home, USERPROFILE=home,
                APPDATA=os.path.join(home, "AppData"), XDG_CONFIG_HOME=os.path.join(home, "xdg"))
     for name in ("LEAN_SERVE_PORT", "CLAUDE_PLUGIN_OPTION_SERVE_MODE", "CLAUDE_PLUGIN_OPTION_WORKTREE_ROOTS"):
         env.pop(name, None)
@@ -225,7 +215,8 @@ def run(brain_cli):
     fails = []
     me = brain_cli
     with tempfile.TemporaryDirectory() as d:
-        env = dict(os.environ, LEAN_BRAIN_DB=os.path.join(d, "sub", "brain.db"))
+        env = dict(os.environ, LEAN_BRAIN_DB=os.path.join(d, "sub", "brain.db"),
+                   LEAN_TESTS_DB=os.path.join(d, "tests.db"))
         env.pop("LEAN_SESSION_ID", None)
         env.pop("LEAN_SESSION_CWD", None)
 
@@ -287,23 +278,7 @@ def run(brain_cli):
         if rc == 0 or "test-fail" not in err or "review-finding" not in err:
             fails.append(f"an unknown kind must be refused with the list: {rc} {err!r}")
 
-        # Runs and their link to items, and stats over them.
-        ids = []
-        for tier, dur, wait in (("full", 100, 10), ("full", 300, 30), ("rerun", 5, 0)):
-            rc, out, _ = run("run-add", "--cycle", "c1", "--project", "core", "--test-project", "T.csproj",
-                             "--tier", tier, "--runner", "mtp", "--started", "1000", "--ended", str(1000 + dur),
-                             "--lane-wait", str(wait), "--passed", "9", "--failed", "1", "--exit-code", "1")
-            ids.append(out)
-        # A valid runner reaches the missing --tier error; an unknown one stops at its own choice list. No row is added.
-        for runner, test in (("playwright", "e2e/playwright.config.ts"), ("go", "./...")):
-            rc, _, err = run("run-add", "--project", "core", "--test-project", test, "--runner", runner)
-            if "invalid choice" in err or "--tier" not in err:
-                fails.append(f"run-add must accept --runner {runner}: {rc} {err!r}")
-        rc, _, err = run("run-add", "--project", "core", "--test-project", "T.csproj", "--runner", "nope")
-        if "invalid choice" not in err:
-            fails.append(f"run-add must refuse an unknown runner: {rc} {err!r}")
-        if ids != ["1", "2", "3"]:
-            fails.append(f"run ids: {ids}")
+        # An item still carries a run id, though the runs live in tests.db now.
         run("add", "--project", "core", "--kind", "flaky", "--ref", "Other.Flaky", "--run-id", "2", "--cycle", "c1")
         rc, out, _ = run("show", "5")
         if "run id: 2" not in out:
@@ -314,17 +289,15 @@ def run(brain_cli):
         except ValueError:
             s = {}
             fails.append(f"stats --json not json: {out!r}")
-        suite = (s.get("suites") or [{}])[0]
-        if suite.get("runs") != 2 or suite.get("mean_duration_s") != 200 or suite.get("mean_lane_wait_s") != 20 \
-                or suite.get("flaky_items") != 1 or suite.get("flaky_rate") != 0.5:
-            fails.append(f"suite stats wrong (reruns must not count as runs): {suite}")
-        if (s.get("slowest") or [{}])[0].get("duration_s") != 300:
-            fails.append(f"slowest wrong: {s.get('slowest')}")
+        if any(k in s for k in ("suites", "slowest")):
+            fails.append(f"stats must not carry run data: {sorted(s)}")
+        if not all(k in s for k in ("by_kind_status", "open_by_project", "stale_agents", "median_close_s")):
+            fails.append(f"stats keys missing: {sorted(s)}")
         if not any(r["kind"] == "flaky" and r["status"] == "open" for r in s.get("by_kind_status", [])) \
                 or "test-fail" not in s.get("median_close_s", {}):
             fails.append(f"counts or median close missing: {s}")
         rc, out, _ = run("stats")
-        if "flaky rate" not in out or "T.csproj" not in out or "open by project" not in out:
+        if "open by project" not in out or "suites" in out or "slowest" in out:
             fails.append(f"stats table: {out!r}")
         rc, out, _ = run("export", "--format", "md")
         if not out.startswith("# Brain") or "## core" not in out or "Foo.Bar" not in out:
@@ -343,7 +316,7 @@ def run(brain_cli):
         run("add", "--project", "other", "--kind", "blocker", "--ref", "x")
         rc, out, _ = run("resume", "--project", "res")
         order = [l.split()[2] for l in out.splitlines()[1:]]
-        if rc != 0 or out.splitlines()[0] != "brain: 6 open and 0 queued or running for res" or order != ["b1", "a1", "p2", "p1", "q1", "f1"]:
+        if rc != 0 or out.splitlines()[0] != "brain: 6 open for res" or order != ["b1", "a1", "p2", "p1", "q1", "f1"]:
             fails.append(f"resume order (blocker, agent, pending newest first, question, rest): {out!r}")
         rc, out, _ = run("resume", "--project", "res", "--max", "5")
         lines = out.splitlines()
@@ -362,439 +335,7 @@ def run(brain_cli):
             fails.append(f"resume with no database must print nothing and create nothing: {rc} {out!r} {err!r}")
         env["LEAN_BRAIN_DB"] = os.path.join(d, "sub", "brain.db")
 
-        # The queue: ordering, dependencies, cancel propagation, claiming.
-        def nxt(*extra):
-            out = run("queue", "next", *extra)[1]
-            return json.loads(out) if out else None
-
-        j1 = run("queue", "add", "/tmp/r", "A.csproj", "--cycle", "q", "--by", "me")[1]
-        j2 = run("queue", "add", "/tmp/r", "A.csproj", "--tier", "fast", "--filter", "Unit", "--after", j1)[1]
-        j3 = run("queue", "add", "/tmp/r", "B.csproj", "--after", j2)[1]
-        j4 = run("queue", "add", "/tmp/r", "C.csproj")[1]
-        if [j1, j2, j3, j4] != ["5", "6", "7", "8"] and not all(x.isdigit() for x in (j1, j2, j3, j4)):
-            fails.append(f"queue add must print the job id: {[j1, j2, j3, j4]}")
-        if run("queue", "add", "/tmp/r", "A.csproj", "--tier", "fast")[0] == 0:
-            fails.append("a fast job without a filter accepted")
-        if run("queue", "add", "/tmp/r", "A.csproj", "--after", "9999")[0] == 0:
-            fails.append("a job after a missing job accepted")
-        first = nxt()
-        if not first or str(first["id"]) != j1 or first["status"] != "queued":
-            fails.append(f"oldest ready job first: {first}")
-        second = nxt()
-        if not second or str(second["id"]) != j4:
-            fails.append(f"a job whose dependency has not finished must wait, so the next ready one is {j4}: {second}")
-        if nxt("--peek") is not None:
-            fails.append("nothing is ready while the dependencies run")
-        run("queue", "finish", j4, "--status", "done")
-        run("queue", "finish", j1, "--status", "done")
-        third = nxt()
-        if not third or str(third["id"]) != j2:
-            fails.append(f"dependent not ready after its dependency finished: {third}")
-        out = run("queue", "finish", j2, "--status", "failed", "--reason", "tests failed")[1]
-        rc, out, _ = run("queue", "list", "--status", "cancelled")
-        if f"job #{j3} cancelled" not in out or f"dependency #{j2} failed" not in out:
-            fails.append(f"a failed dependency must cancel its dependents: {out!r}")
-        if nxt() is not None:
-            fails.append("a cancelled job was claimed")
-        k1 = run("queue", "add", "/tmp/r", "D.csproj")[1]
-        k2 = run("queue", "add", "/tmp/r", "D.csproj", "--after", k1)[1]
-        k3 = run("queue", "add", "/tmp/r", "D.csproj", "--after", k2)[1]
-        run("queue", "cancel", k1)
-        out = run("queue", "list", "--status", "cancelled")[1]
-        if f"job #{k2} cancelled" not in out or f"job #{k3} cancelled" not in out:
-            fails.append(f"cancel must reach every dependent: {out!r}")
-        rc, out, err = run("queue", "cancel", j1)
-        if rc == 0:
-            fails.append("a finished job was cancelled")
-        late = run("queue", "add", "/tmp/r", "F.csproj", "--after", j2)[1]
-        late2 = run("queue", "add", "/tmp/r", "F.csproj", "--after", k1)[1]
-        ja = run("queue", "add", "/tmp/r", "G.csproj", "--args=-p:A=1 -p:B=two", "--cycle", "qa")[1]
-        got = nxt()
-        if not got or str(got["id"]) != ja or got.get("args") != "-p:A=1 -p:B=two":
-            fails.append(f"a job must keep its extra arguments: {got}")
-        run("queue", "finish", ja, "--status", "done")
-        out = run("queue", "list", "--status", "cancelled")[1]
-        if f"job #{late} cancelled" not in out or f"dependency #{j2} failed" not in out \
-                or f"job #{late2} cancelled" not in out or f"dependency #{k1} cancelled" not in out:
-            fails.append(f"a job added after a failed or cancelled job must be cancelled with the reason: {out!r}")
-        if nxt("--peek") is not None:
-            fails.append("a job added behind a dead dependency became ready")
-        d1 = run("queue", "add", "/tmp/r", "H.csproj", "--tier", "fast", "--filter", "X")[1]
-        rc, d2, err = run("queue", "add", "/tmp/r", "H.csproj", "--tier", "fast", "--filter", "X", "--by", "other")
-        if rc != 0 or d2 != d1 or f"#{d1}" not in err:
-            fails.append(f"a job already queued must be joined, not added again: {d1} {d2} {err!r}")
-        d3 = run("queue", "add", "/tmp/r", "H.csproj", "--tier", "fast", "--filter", "Y")[1]
-        if d3 == d1:
-            fails.append("a different filter is a different job")
-        run("queue", "cancel", d1)
-        run("queue", "cancel", d3)
-
-        # One full run per commit, identical queued jobs joined by commit, no full run from a dirty tree.
-        g = os.path.join(d, "gitrepo")
-        os.makedirs(g)
-
-        def git(*args):
-            subprocess.run(["git", "-C", g, "-c", "user.name=t", "-c", "user.email=t@t", *args], check=True,
-                           capture_output=True)
-        git("init", "-q")
-        with open(os.path.join(g, "f.txt"), "w") as f:
-            f.write("one\n")
-        git("add", "f.txt")
-        git("commit", "-q", "-m", "one")
-        rc, c1, _ = run("queue", "add", g, "T.csproj")
-        rc, out, err = run("queue", "add", g, "T.csproj", "--cycle", "other")
-        if rc != 0 or out != c1:
-            fails.append(f"a full job identical to a queued one must return its id: {rc} {out!r} {err!r}")
-        rc, out, err = run("queue", "add", g, "T.csproj", "--args=-p:A=1")
-        if rc == 0 or f"#{c1}" not in err:
-            fails.append(f"a different full job for a commit with a full job queued must be refused with its id: {rc} {out!r} {err!r}")
-        run("queue", "finish", c1, "--status", "done")
-        rc, out, err = run("queue", "add", g, "T.csproj")
-        if rc == 0 or f"#{c1}" not in err or "done" not in err:
-            fails.append(f"a full job for a commit with a done full job must be refused with its id: {rc} {out!r} {err!r}")
-        rc, c2, _ = run("queue", "add", g, "T.csproj", "--again", "flaky infra, rerun")
-        if rc != 0 or c2 == c1 or "again: flaky infra, rerun" not in run("queue", "list", "--status", "queued")[1]:
-            fails.append(f"--again must allow a second full job and keep the reason: {rc} {c2!r}")
-        rc, c2b, _ = run("queue", "add", g, "T.csproj", "--again", "once more")
-        if c2b != c2:
-            fails.append(f"--again must still join an identical queued job: {c2} {c2b}")
-        if run("queue", "add", g, "U.csproj")[0] != 0:
-            fails.append("a full job for another test project of the same commit must be allowed")
-        run("queue", "cancel", c2)
-        if run("queue", "add", g, "T.csproj", "--tier", "fast", "--filter", "X")[0] != 0:
-            fails.append("a fast job is never refused for an earlier full job")
-        f1 = run("queue", "add", g, "V.csproj", "--tier", "fast", "--filter", "X")[1]
-        f2 = run("queue", "add", g, "V.csproj", "--tier", "fast", "--filter", "X")[1]
-        if f1 != f2:
-            fails.append(f"an add identical to a queued job must return its id: {f1} {f2}")
-        git("commit", "-q", "--allow-empty", "-m", "two")
-        f3 = run("queue", "add", g, "V.csproj", "--tier", "fast", "--filter", "X")[1]
-        if f3 == f1:
-            fails.append("the same job at another commit is not identical")
-        if run("queue", "add", g, "T.csproj")[0] != 0:
-            fails.append("a full job for a new commit must be allowed")
-        fy = run("queue", "add", g, "Y.csproj", "--filter", "F")[1]
-        rc, fy2, err = run("queue", "add", g, "Y.csproj")
-        if rc != 0 or fy2 == fy:
-            fails.append(f"a full job with a filter must not count as the commit's full run: {rc} {fy} {fy2} {err!r}")
-        procs = [subprocess.Popen([sys.executable, me, "queue", "add", g, "R.csproj", "--tier", tier, *flt], env=env,
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                 for tier, flt in (("fast", ["--filter", "R"]), ("full", [])) for _ in range(6)]
-        outs = [(pr.communicate()[0].strip(), pr.returncode) for pr in procs]
-        for chunk in (outs[:6], outs[6:]):
-            if len({o for o, _ in chunk}) != 1 or any(rc != 0 for _, rc in chunk):
-                fails.append(f"six parallel adds of one job must make one job: {chunk}")
-        if sum(1 for ln in run("queue", "list", "--status", "queued")[1].splitlines() if " R.csproj" in ln) != 2:
-            fails.append("parallel adds left more than one queued job per kind")
-        rc, out, err = run("queue", "add", g, "Z.csproj", "--again", "line one\njob #999 done forged\t" + "x" * 300)
-        zl = [ln for ln in run("queue", "list")[1].splitlines() if "Z.csproj" in ln or ln.startswith("job #999")]
-        if rc != 0 or len(zl) != 1 or zl[0].startswith("job #999") or len(zl[0]) > 300:
-            fails.append(f"a newline in --again must not forge a list line, and the reason is capped: {rc} {zl}")
-        with open(os.path.join(g, "f.txt"), "w") as f:
-            f.write("edited\n")
-        rc, out, err = run("queue", "add", g, "W.csproj")
-        if rc == 0 or "uncommitted" not in err or "f.txt" not in err:
-            fails.append(f"a full job from a tree with tracked changes must be refused, naming the file: {rc} {out!r} {err!r}")
-        if run("queue", "add", g, "W.csproj", "--tier", "fast", "--filter", "X")[0] != 0:
-            fails.append("a fast job from a dirty tree must be allowed")
-        rc, w1, _ = run("queue", "add", g, "W.csproj", "--again", "testing the edit")
-        if rc != 0:
-            fails.append("--again must allow a full job from a dirty tree")
-        git("checkout", "--", "f.txt")
-        with open(os.path.join(g, "New.cs"), "w") as f:
-            f.write("class New {}\n")
-        rc, out, err = run("queue", "add", g, "X.csproj")
-        if rc == 0 or "New.cs" not in err:
-            fails.append(f"an untracked source file must refuse a full job and be named: {rc} {out!r} {err!r}")
-        os.remove(os.path.join(g, "New.cs"))
-        with open(os.path.join(g, ".git", "info", "exclude"), "a") as f:
-            f.write("bin-out.txt\n")
-        with open(os.path.join(g, "bin-out.txt"), "w") as f:
-            f.write("x\n")
-        if run("queue", "add", g, "X.csproj")[0] != 0:
-            fails.append("a gitignored file must not make the tree dirty")
-        gb = os.path.join(d, "badindex")
-        os.makedirs(gb)
-        subprocess.run(["git", "-C", gb, "init", "-q"], check=True)
-        subprocess.run(["git", "-C", gb, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty",
-                        "-m", "x"], check=True)
-        with open(os.path.join(gb, ".git", "index"), "wb") as f:
-            f.write(b"garbage that is not an index")
-        rc, out, err = run("queue", "add", gb, "B.csproj")
-        if rc == 0 or "git status failed" not in err:
-            fails.append(f"a failing git status must refuse a full job, not pass as clean: {rc} {out!r} {err!r}")
-        if run("queue", "add", gb, "B.csproj", "--again", "broken index")[0] != 0:
-            fails.append("--again must allow a full job when git status fails")
-        for line in run("queue", "list", "--status", "queued")[1].splitlines():
-            if " gitrepo " in line or " badindex " in line:
-                run("queue", "cancel", line.split()[1][1:])
-        b1 = run("queue", "add", "/tmp/r", "I.csproj")[1]
-        b2 = run("queue", "add", "/tmp/r", "J.csproj")[1]
-        b3 = run("queue", "add", "/tmp/r", "J.csproj", "--after", b2)[1]
-        rc, out, _ = run("queue", "bump", b2)
-        if rc != 0 or f"#{b2}" not in out or f"#{b3}" not in out:
-            fails.append(f"bump must reach the jobs chained after it: {out!r}")
-        if f"job #{b2} queued full r J.csproj bumped" not in run("queue", "list", "--status", "queued")[1]:
-            fails.append("a bumped job must show as bumped")
-        got = nxt()
-        if not got or str(got["id"]) != b2:
-            fails.append(f"a bumped job must be claimed before older jobs: {got}")
-        run("queue", "finish", b2, "--status", "done")
-        got = nxt()
-        if not got or str(got["id"]) != b3:
-            fails.append(f"a bumped chain must keep its order: {got}")
-        run("queue", "finish", b3, "--status", "done")
-        run("queue", "cancel", b1)
-        if run("queue", "bump", b1)[0] == 0:
-            fails.append("only a queued job can be bumped")
-        m1, m2, m3 = (run("queue", "add", "/tmp/r", f"M{i}.csproj")[1] for i in (1, 2, 3))
-        mine = {m1, m2, m3}
-
-        def order():  # the queued jobs of this block, in the order the drainer would take them
-            lines = run("queue", "list", "--status", "queued")[1].splitlines()
-            return [i for i in (ln.split()[1][1:] for ln in lines) if i in mine]
-        if order() != [m1, m2, m3]:
-            fails.append(f"queued jobs must list in run order: {order()}")
-        rc, out, _ = run("queue", "move", m3, "up")
-        if rc != 0 or order() != [m1, m3, m2]:
-            fails.append(f"move up must swap a job with the one before it: {out!r} {order()}")
-        run("queue", "move", m3, "up")
-        if order() != [m3, m1, m2]:
-            fails.append(f"a second move up must take it to the front: {order()}")
-        run("queue", "move", m3, "down")
-        if order() != [m1, m3, m2]:
-            fails.append(f"move down must swap a job with the one after it: {order()}")
-        run("queue", "bump", m2)
-        if order() != [m2, m1, m3]:
-            fails.append(f"bump must reach the front even past moved jobs: {order()}")
-        m4 = run("queue", "add", "/tmp/r", "M4.csproj")[1]
-        mine.add(m4)
-        if order() != [m2, m1, m3, m4]:
-            fails.append(f"a new job must go to the back of a reordered queue: {order()}")
-        m5 = run("queue", "add", "/tmp/r", "M5.csproj", "--after", m4)[1]
-        mine.add(m5)
-        if run("queue", "move", m5, "up")[0] == 0 or order()[-2:] != [m4, m5]:
-            fails.append(f"a job must not move ahead of the job it waits on: {order()}")
-        if run("queue", "move", m4, "down")[0] == 0 or order()[-2:] != [m4, m5]:
-            fails.append(f"a job must not move behind a job that waits on it: {order()}")
-        for m in mine:
-            run("queue", "cancel", m)
-        if run("queue", "move", m1, "up")[0] == 0:
-            fails.append("only a queued job can be moved")
-        k4 = run("queue", "add", "/tmp/r", "E.csproj", "--cycle", "q2")[1]
-        out = run("resume", "--project", "r")[1]
-        if f"job #{k4} queued full r E.csproj" not in out or "queued or running" not in out:
-            fails.append(f"resume must list queued jobs: {out!r}")
-        run("queue", "cancel", k4)
-
-        # Platform, host and requeue: what a remote lane needs from the queue.
-        rp = os.path.join(d, "plat")
-        os.makedirs(os.path.join(rp, "Apple.Tests"))
-        os.makedirs(os.path.join(rp, "Plain.Tests"))
-        with open(os.path.join(rp, "Apple.Tests", "Apple.Tests.csproj"), "w") as f:
-            f.write("<Project><PropertyGroup><TargetFrameworks>net10.0;net10.0-maccatalyst</TargetFrameworks>"
-                    "</PropertyGroup></Project>")
-        with open(os.path.join(rp, "Plain.Tests", "Plain.Tests.csproj"), "w") as f:
-            f.write("<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>")
-        pa = run("queue", "add", rp, "Apple.Tests")[1]
-        if "platform=apple" not in run("queue", "list", "--status", "queued")[1]:
-            fails.append("a test project targeting maccatalyst must queue as platform=apple")
-        if nxt("--where", "remote") is not None:
-            fails.append("a remote lane claimed an apple job")
-        got = nxt("--where", "local", "--host", "dev")
-        if not got or str(got["id"]) != pa:
-            fails.append(f"the local lane must claim an apple job: {got}")
-        if f"job #{pa} running" not in run("queue", "list", "--status", "running")[1] \
-                or "on=dev" not in run("queue", "list", "--status", "running")[1]:
-            fails.append("a running job must show its host")
-        rc, out, _ = run("queue", "requeue", pa, "--reason", "ssh failed")
-        ql = run("queue", "list", "--status", "queued")[1]
-        if rc != 0 or f"job #{pa} queued" not in ql or "ssh failed" not in ql or "on=" in ql:
-            fails.append(f"requeue must put a running job back with its reason and no host: {rc} {ql!r}")
-        run("queue", "cancel", pa)
-        pp = run("queue", "add", rp, "Plain.Tests/Plain.Tests.csproj")[1]
-        if "platform=" in [x for x in run("queue", "list", "--status", "queued")[1].splitlines()
-                           if x.startswith(f"job #{pp} ")][0]:
-            fails.append("a plain net10.0 job must not carry a platform")
-        got = nxt("--where", "remote", "--host", "dev")
-        if not got or str(got["id"]) != pp or got["host"] != "dev":
-            fails.append(f"a remote lane must claim a plain job and store its host: {got}")
-        # detect_platform is conservative: Apple signals anywhere in the build chain, or anything unknown.
-        def mk(rel, body):
-            full = os.path.join(rp, rel)
-            os.makedirs(os.path.dirname(full), exist_ok=True)
-            with open(full, "w") as f:
-                f.write(body)
-        net = "<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"
-        mk("Cond/Cond.csproj", '<Project><PropertyGroup><TargetFrameworks Condition="\'$(OS)\' == \'OSX\'">'
-                               "net10.0-maccatalyst</TargetFrameworks></PropertyGroup></Project>")
-        mk("Ref/Ref.csproj", '<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>'
-                             '<ItemGroup><ProjectReference Include="..\\Lib\\Lib.csproj" /></ItemGroup></Project>')
-        mk("Lib/Lib.csproj", '<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>'
-                             '<ItemGroup><ProjectReference Include="../Mid/Mid.csproj" /></ItemGroup></Project>')
-        mk("Mid/Mid.csproj", '<Project><PropertyGroup><UseMaui>true</UseMaui></PropertyGroup>'
-                             '<ItemGroup><ProjectReference Include="../Ref/Ref.csproj" /></ItemGroup></Project>')
-        mk("Props/Sub/Sub.csproj", net)
-        mk("Props/Directory.Build.props", "<Project><PropertyGroup><TargetFrameworks>net10.0-ios"
-                                          "</TargetFrameworks></PropertyGroup></Project>")
-        mk("Two/A.csproj", net)
-        mk("Two/B.csproj", net)
-        for rel, want in (("Cond/Cond.csproj", "apple"), ("Ref/Ref.csproj", "apple"),
-                          ("Props/Sub/Sub.csproj", "apple"), ("Nope/Nope.csproj", "apple"),
-                          ("Two", "apple"), ("Plain.Tests/Plain.Tests.csproj", "")):
-            if detect_platform(rp, rel) != want:
-                fails.append(f"detect_platform({rel}) must be {want!r}")
-        # An npm job whose .npmrc names a registry other than npmjs stays on the local lane: the login is on this machine.
-        mk("Web/package.json", "{}")
-        mk("Web/.npmrc", "@acme:registry=https://pkgs.dev.azure.com/o/_packaging/f/npm/registry/\n")
-        mk("Pub/package.json", "{}")
-        mk("Pub/.npmrc", "# comment\nregistry=https://registry.npmjs.org/\n")
-        mk("Env/package.json", "{}")
-        mk("Env/.npmrc", "registry=${NPM_REGISTRY}\n")
-        mk("Up/Deep/package.json", "{}")
-        mk("Up/.npmrc", "registry=https://pkgs.example.com/npm/\n")
-        mk("Bare/package.json", "{}")
-        mk("Tok/package.json", "{}")
-        mk("Tok/.npmrc", "//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n")
-        mk("Lit/package.json", "{}")
-        mk("Lit/.npmrc", "registry=https://registry.npmjs.org/\n//registry.npmjs.org/:_authToken=npm_abc\n")
-        mk("Basic/package.json", "{}")
-        mk("Basic/.npmrc", "_auth=abc\n")
-        mk("Pw/package.json", "{}")
-        mk("Pw/.npmrc", "//registry.npmjs.org/:_password=abc\n")
-        mk("Usr/package.json", "{}")
-        mk("Usr/.npmrc", "//registry.npmjs.org/:username=me\n")
-        mk("Bom/package.json", "{}")
-        with open(os.path.join(rp, "Bom", ".npmrc"), "w", encoding="utf-8-sig") as fh:
-            fh.write("registry=https://pkgs.example.com/npm/\n")
-        for rel, want in (("Web/package.json", "private"), ("Pub/package.json", ""), ("Env/package.json", "private"),
-                          ("Up/Deep/package.json", "private"), ("Bare/package.json", ""),
-                          ("Tok/package.json", "private"), ("Lit/package.json", "private"),
-                          ("Basic/package.json", "private"), ("Pw/package.json", "private"),
-                          ("Usr/package.json", "private"), ("Bom/package.json", "private")):
-            if detect_platform(rp, rel) != want:
-                fails.append(f"detect_platform({rel}) must be {want!r}")
-        pn = run("queue", "add", rp, "Web/package.json")[1]
-        if "platform=private" not in [x for x in run("queue", "list", "--status", "queued")[1].splitlines()
-                                      if x.startswith(f"job #{pn} ")][0]:
-            fails.append("an npm job with a private registry must queue as platform=private")
-        if nxt("--where", "remote", "--peek") is not None and nxt("--where", "remote", "--peek")["id"] == int(pn):
-            fails.append("a remote lane claimed an npm job that needs a private feed")
-        rc, out, err = run("queue", "route", pn, "--to", "remote")
-        if rc == 0 or "private npm feed" not in err or "--force" not in err:
-            fails.append(f"route --to remote on a private feed job must be refused without --force: {rc} {out!r} {err!r}")
-        rc, out, err = run("queue", "route", pn, "--to", "any")
-        if rc == 0 or "private npm feed" not in err or "--force" not in err:
-            fails.append(f"route --to any on a private feed job must be refused without --force: {rc} {out!r} {err!r}")
-        rc, out, err = run("queue", "route", pn, "--to", "remote", "--force")
-        if rc != 0 or "platform=remote" not in out or "private npm feed" not in err:
-            fails.append(f"route --to remote --force must send a private job and warn: {rc} {out!r} {err!r}")
-        run("queue", "route", pn, "--to", "local")
-        rc, out, err = run("queue", "route", pn, "--to", "any", "--force")
-        if rc != 0:
-            fails.append(f"route --to any --force must be allowed on a private job: {rc} {out!r} {err!r}")
-        run("queue", "cancel", pn)
-        # Go: a package pattern is a test path only in a repo with go.mod.
-        rc, out, err = run("queue", "add", rp, ".")
-        if rc == 0 or "not a test path" not in err:
-            fails.append(f"a Go pattern without go.mod must be refused: {rc} {out!r} {err!r}")
-        mk("go.mod", "module x\n")
-        os.makedirs(os.path.join(rp, "cmd", "x"), exist_ok=True)
-        for pat in (".", "./cmd/x", "./..."):
-            rc, out, err = run("queue", "add", rp, pat)
-            if rc != 0:
-                fails.append(f"a Go pattern {pat} with go.mod must be accepted: {rc} {out!r} {err!r}")
-            else:
-                if detect_platform(rp, pat) != "private":
-                    fails.append(f"a Go job must stay on the local lane: detect_platform({pat})")
-                run("queue", "cancel", out.strip())
-        os.remove(os.path.join(rp, "go.mod"))
-        # Gradle: a settings file or its folder is a Gradle job. It stays local, and an iOS test task makes it apple.
-        mk("kmp/settings.gradle.kts", "rootProject.name = \"x\"\n")
-        mk("groovy/settings.gradle", "rootProject.name = 'x'\n")
-        for rel, args, want in (("kmp/settings.gradle.kts", None, "private"), ("kmp", None, "private"),
-                                ("groovy/settings.gradle", None, "private"), ("groovy", "jvmTest", "private"),
-                                ("kmp", "jvmTest iosSimulatorArm64Test", "apple"), ("kmp", "iosX64Test", "apple"),
-                                ("kmp", "jvmTest --tests Fooios", "private"), ("kmp", "IOSArm64Test", "apple"),
-                                ("kmp", "jvmTest -x iosX64Test", "private"), ("kmp", "compileKotlinIosArm64", "private")):
-            if detect_platform(rp, rel, args) != want:
-                fails.append(f"detect_platform({rel}, {args!r}) must be {want!r}")
-        gj = run("queue", "add", rp, "kmp")[1]
-        if "platform=private" not in [x for x in run("queue", "list", "--status", "queued")[1].splitlines()
-                                      if x.startswith(f"job #{gj} ")][0]:
-            fails.append("a Gradle job must queue as platform=private")
-        if nxt("--where", "remote", "--peek") is not None and nxt("--where", "remote", "--peek")["id"] == int(gj):
-            fails.append("a remote lane claimed a Gradle job")
-        for to in ("remote", "any"):
-            for force in ([], ["--force"]):
-                rc, out, err = run("queue", "route", gj, "--to", to, *force)
-                if rc == 0 or "Gradle" not in err or "--to local" not in err or "pass --force" in err:
-                    fails.append(f"route --to {to} {force} on a Gradle job must be refused and name --to local: {rc} {out!r} {err!r}")
-        rc, out, err = run("queue", "add", rp, "kmp", "--platform", "none")
-        if rc == 0 or "Gradle" not in err:
-            fails.append(f"queue add --platform none on a Gradle job must be refused: {rc} {out!r} {err!r}")
-        rc, out, err = run("queue", "route", gj, "--to", "local")
-        if rc != 0 or "platform=private" not in out:
-            fails.append(f"route --to local must keep a Gradle job private: {rc} {out!r} {err!r}")
-        # A remote lane that still got a Gradle job (a platform cleared by hand) hands it back: requeue pins it again.
-        import sqlite3 as sq1
-        c1 = sq1.connect(env["LEAN_BRAIN_DB"])
-        c1.execute("UPDATE jobs SET platform='' WHERE id=?", (gj,))
-        c1.commit()
-        c1.close()
-        if nxt("--where", "remote", "--peek") is None or nxt("--where", "remote", "--peek")["id"] != int(gj):
-            fails.append("setup: a job with no platform must be open to a remote lane")
-        run("queue", "next", "--where", "remote", "--host", "dev")
-        run("queue", "requeue", gj, "--reason", "a Gradle job reached a remote lane")
-        if nxt("--where", "remote", "--peek") is not None and nxt("--where", "remote", "--peek")["id"] == int(gj):
-            fails.append("requeue must pin a Gradle job to the local lane")
-        run("queue", "cancel", gj)
-        gi = run("queue", "add", rp, "kmp", "--args=iosSimulatorArm64Test")[1]
-        if "platform=apple" not in [x for x in run("queue", "list", "--status", "queued")[1].splitlines()
-                                    if x.startswith(f"job #{gi} ")][0]:
-            fails.append("a Gradle job with an iOS test task must queue as platform=apple")
-        run("queue", "cancel", gi)
-        # route: send a queued job to a remote lane, back to the Mac, or to whichever lane is free.
-        ra = run("queue", "add", rp, "Apple.Tests")[1]
-        rc, out, err = run("queue", "route", ra, "--to", "remote")
-        if rc == 0 or "Apple" not in err or "--force" not in err:
-            fails.append(f"route --to remote on an apple project must be refused without --force: {rc} {out!r} {err!r}")
-        if nxt("--where", "remote", "--peek") is not None or nxt("--where", "local", "--peek") is None:
-            fails.append("a refused route must leave the platform unchanged")
-        rc, out, err = run("queue", "route", ra, "--to", "remote", "--force")
-        if rc != 0 or f"job #{ra} queued" not in out or "platform=remote" not in out or "Apple" not in err:
-            fails.append(f"route --to remote --force must mark the job and warn about an apple project: {rc} {out!r} {err!r}")
-        if nxt("--where", "local", "--peek") is not None:
-            fails.append("the local lane must not claim a job routed to a remote lane")
-        rb = run("queue", "add", rp, "Plain.Tests", "--after", ra)[1]
-        rc, out, _ = run("queue", "route", rb, "--to", "local")
-        if rc != 0 or "platform=apple" not in out:
-            fails.append(f"route --to local must mark the job apple: {rc} {out!r}")
-        if nxt("--where", "remote", "--peek") is None or nxt("--where", "remote", "--peek")["id"] != int(ra):
-            fails.append("a remote lane must see a job routed to it")
-        rc, out, err = run("queue", "route", ra, "--to", "any")
-        if rc != 0 or "platform=" in out or err:
-            fails.append(f"route --to any must clear the platform without a warning: {rc} {out!r} {err!r}")
-        got = nxt("--where", "local")
-        if not got or got["id"] != int(ra):
-            fails.append(f"the local lane must claim a job routed to any: {got}")
-        if run("queue", "route", ra, "--to", "remote")[0] == 0:
-            fails.append("route of a running job must fail")
-        if run("queue", "route", "99999", "--to", "remote")[0] == 0:
-            fails.append("route of a missing job must fail")
-        run("queue", "finish", ra, "--status", "done")
-        run("queue", "cancel", rb)
-        run("queue", "finish", pp, "--status", "done")
-        if run("queue", "requeue", pp, "--reason", "x")[0] == 0:
-            fails.append("requeue of a done job must fail")
-        rc, out, _ = run("run-add", "--project", "r", "--test-project", "T", "--tier", "full", "--host", "dev")
-        import sqlite3 as sq0
-        c0 = sq0.connect(env["LEAN_BRAIN_DB"])
-        hosts = [x[0] for x in c0.execute("SELECT host FROM runs WHERE id=?", (out,))]
-        ver = c0.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-        c0.close()
-        if hosts != ["dev"]:
-            fails.append(f"run-add --host must store the host: {hosts}")
+        ver = connect_rows(env["LEAN_BRAIN_DB"], "SELECT value FROM meta WHERE key='schema_version'")[0][0]
         if ver != str(len(MIGRATIONS)):
             fails.append(f"schema version after open: {ver}")
 
@@ -807,11 +348,6 @@ def run(brain_cli):
         subprocess.run(git + ["worktree", "add", "-q", wt, "-b", "side"], check=True, capture_output=True)
         subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-C", wt, "commit", "-q", "--allow-empty",
                         "-m", "y"], check=True)
-        jw = run("queue", "add", wt, "W.csproj")[1]
-        jm = run("queue", "add", main_repo, "W.csproj")[1]
-        ql = run("queue", "list")[1]
-        if f"job #{jw} queued full mainrepo W.csproj" not in ql or f"job #{jm} queued full mainrepo W.csproj" not in ql:
-            fails.append(f"a worktree must share the main repository's project name: {ql!r}")
         if project_of(os.path.join(wt, ".")) != "mainrepo" or project_of(os.path.join(d, "nogit")) != "nogit":
             fails.append("project_of for a worktree or a plain directory")
 
@@ -1100,47 +636,10 @@ def run(brain_cli):
             fails.append(f"list is newest first by ts: {names}")
         digest_tests(fails, me, d)
 
-        # flaky-clear closes a flaky item after 5 passing full runs of its test project since it was last seen.
+        # close still accepts the flaky-cleared resolution that test-phase sets.
         env["LEAN_BRAIN_DB"] = os.path.join(d, "flaky.db")
-
-        def frun(project, test, started, rc, tier="full", passed=3, failed=0):
-            return run("run-add", "--project", project, "--test-project", test, "--tier", tier, "--started", str(started),
-                       "--exit-code", str(rc), "--passed", str(passed), "--failed", str(failed))[1]
-
-        r1 = frun("core", "A.csproj", 1000, 1, failed=1)
-        r2 = frun("core", "B.csproj", 1000, 1, failed=1)
-        run("add", "--project", "core", "--kind", "flaky", "--ref", "A.One", "--run-id", r1)
-        run("add", "--project", "core", "--kind", "flaky", "--ref", "B.One", "--run-id", r2)
-        run("add", "--project", "core", "--kind", "test-fail", "--ref", "A.Real", "--run-id", r1)
-        for i in range(5):  # all before the item was last seen: they cannot clear it
-            frun("core", "A.csproj", 1001 + i, 0)
-        rc, out, _ = run("flaky-clear", "--project", "core", "--test-project", "A.csproj")
-        if rc != 0 or out:
-            fails.append(f"passing runs older than the last sighting must not clear a flaky item: {rc} {out!r}")
-        future = 4102444800  # year 2100, after any sighting made now
-        for i in range(4):
-            frun("core", "A.csproj", future + i, 0)
-        frun("core", "A.csproj", future + 9, 1, failed=1)  # a failing run does not count
-        frun("core", "A.csproj", future + 10, 0, tier="rerun")  # nor does a rerun
-        frun("core", "B.csproj", future + 11, 0)  # nor a run of another test project
-        rc, out, _ = run("flaky-clear", "--project", "core", "--test-project", "A.csproj")
-        if out:
-            fails.append(f"4 passing runs must not clear it: {out!r}")
-        frun("core", "A.csproj", future + 12, 0)
-        rc, out, _ = run("flaky-clear", "--project", "core", "--test-project", "A.csproj")
-        if "closed: #1 closed flaky" not in out:
-            fails.append(f"5 passing runs must close the flaky item: {rc} {out!r}")
-        rc, out, _ = run("show", "1")
-        if "resolution: flaky-cleared" not in out or "5 passing runs" not in out:
-            fails.append(f"the item must carry resolution flaky-cleared: {out!r}")
-        rc, out, _ = run("list", "--open")
-        if "B.One" not in out or "A.Real" not in out or "A.One" in out:
-            fails.append(f"only the cleared flaky item may close, not another project's or a test-fail: {out!r}")
-        rc, out, _ = run("flaky-clear", "--project", "core", "--test-project", "B.csproj", "--runs", "0")
-        rc2, out2, _ = run("list", "--open")
-        if rc == 0 or "B.One" not in out2:
-            fails.append(f"--runs 0 must be refused and close nothing: {rc} {out!r} {out2!r}")
-        rc, out, _ = run("close", "2", "--resolution", "flaky-cleared")
+        run("add", "--project", "core", "--kind", "flaky", "--ref", "A.One")
+        rc, out, _ = run("close", "1", "--resolution", "flaky-cleared")
         if rc != 0:
             fails.append(f"close must accept the flaky-cleared resolution: {rc} {out!r}")
         # Project names are stored lower case, so BarakoCMS and barakocms are one project.
@@ -1234,8 +733,6 @@ def run(brain_cli):
         con.execute("INSERT INTO tags VALUES (?, 'a')", (a1,))
         con.execute("INSERT INTO tags VALUES (?, 'b')", (a2,))
         con.execute("INSERT INTO tags VALUES (?, 'a')", (a2,))
-        run_id = con.execute("INSERT INTO runs (project, test_project) VALUES ('Core', 'T')").lastrowid
-        con.execute("INSERT INTO jobs (project, repo_dir, test_project, enqueued_at) VALUES ('Core', '/r', 'T', ?)", (t0,))
         con.commit()
         con.close()
         env["LEAN_BRAIN_DB"] = mixed
@@ -1268,9 +765,6 @@ def run(brain_cli):
         if rows[a10]["resolution"] != "" or rows[a10]["status"] != "closed" or rows[a11]["resolution"] != "fixed" \
                 or rows[a12]["occurrences"] != 2:
             fails.append("closed items, with or without a resolution, must come through unchanged")
-        if connect_rows(mixed, "SELECT project FROM runs")[0]["project"] != "core" \
-                or connect_rows(mixed, "SELECT project FROM jobs")[0]["project"] != "core":
-            fails.append("migration must lower case runs and jobs")
         if connect_rows(mixed, "SELECT value FROM meta WHERE key='schema_version'")[0]["value"] != str(len(MIGRATIONS)):
             fails.append("migration must record the new version")
         if run("close", str(a1), "--resolution", "fixed")[0] != 0 or run("add", "--project", "Core", "--kind",
@@ -1293,17 +787,6 @@ def run(brain_cli):
         run("add", "--project", "p", "--kind", "note", "--ref", "given", "--infer-session", "--session", "mine-1")
         if "session: mine-1" not in run("show", "3")[1]:
             fails.append("an explicit session wins over the inferred one")
-        run("queue", "add", "/tmp/r", "A.csproj", "--session", "job-1", "--session-cwd", "/w")
-        run("queue", "add", "/tmp/r", "B.csproj", "--infer-session")
-        run("queue", "add", "/tmp/r", "C.csproj")
-        sess = [(j["test_project"], j["session_id"], j["session_cwd"])
-                for j in connect_rows(env["LEAN_BRAIN_DB"], "SELECT * FROM jobs ORDER BY id")]
-        if sess != [("A.csproj", "job-1", "/w"), ("B.csproj", "new-1", here), ("C.csproj", "", "")]:
-            fails.append(f"a queued job must record the session that queued it: {sess}")
-        if json.loads(run("queue", "next")[1])["session_id"] != "job-1":
-            fails.append("queue next must hand the drainer the job's session")
-        if run("queue", "add", "/tmp/r", "D.csproj", "--session", "a b;rm")[0] == 0:
-            fails.append("a job session with odd characters must be refused")
         # A blank project is refused; a non-ASCII one is stored lower case.
         env["LEAN_BRAIN_DB"] = os.path.join(d, "proj.db")
         rc, _, err = run("add", "--project", " ", "--kind", "note", "--ref", "r")
@@ -1321,64 +804,17 @@ def run(brain_cli):
         n = out.split("#", 1)[1].split()[0]
         if rc != 0 or "session" in run("show", n)[1] or "2 open sessions" not in err:
             fails.append(f"two open sessions must store none and say so: {rc} {err!r} {run('show', n)[1]!r}")
-        run("queue", "add", "/tmp/r", "A.csproj", "--infer-session")
-        if connect_rows(env["LEAN_BRAIN_DB"], "SELECT session_id FROM jobs")[0]["session_id"] != "":
-            fails.append("a job queued from a folder with two open sessions must carry none")
-
-        # A job that is joined takes the session of the second caller when it had none, and never replaces one.
-        env["LEAN_BRAIN_DB"] = os.path.join(d, "join.db")
-        j1 = run("queue", "add", "/tmp/r", "A.csproj")[1]
-        j2 = run("queue", "add", "/tmp/r", "A.csproj", "--session", "second-1", "--session-cwd", "/w2")[1]
-        run("queue", "add", "/tmp/r", "A.csproj", "--session", "third-1")
-        got = [(r["id"], r["session_id"], r["session_cwd"]) for r in connect_rows(env["LEAN_BRAIN_DB"], "SELECT * FROM jobs")]
-        if j1 != j2 or got != [(int(j1), "second-1", "/w2")]:
-            fails.append(f"a joined job must take the session it lacked and keep it: {j1} {j2} {got}")
-        # queue wait: done, failed, cancelled, unknown id, timeout, and a job that ends while waiting.
-        env["LEAN_BRAIN_DB"] = os.path.join(d, "wait.db")
-        w = [run("queue", "add", "/tmp/r", f"W{n}.csproj", "--by", "me")[1] for n in range(5)]
-        rid = run("run-add", "--cycle", "w", "--project", "r", "--test-project", "W0.csproj", "--tier", "full",
-                  "--passed", "9", "--failed", "1", "--exit-code", "1")[1]
-        run("add", "--project", "r", "--kind", "test-fail", "--ref", "A.B", "--run-id", rid)
-        run("queue", "finish", w[0], "--status", "done", "--run-id", rid)
-        run("queue", "finish", w[1], "--status", "failed", "--reason", "tests failed", "--run-id", rid)
-        run("queue", "cancel", w[2])
-        fast = ("--interval", "1", "--timeout", "5")
-        rc, out, _ = run("queue", "wait", w[0], *fast)
-        if rc != 0 or out != f"job #{w[0]} done passed=9 failed=1 items=#1":
-            fails.append(f"queue wait on a done job: {rc} {out!r}")
-        rc, out, _ = run("queue", "wait", w[0], w[1], *fast)
-        lines = out.splitlines()
-        if rc != 1 or len(lines) != 2 or "failed passed=9 failed=1 items=#1 (tests failed)" not in lines[1]:
-            fails.append(f"queue wait with a failed job must print a line each and exit 1: {rc} {out!r}")
-        rc, out, _ = run("queue", "wait", w[2], *fast)
-        if rc != 1 or f"job #{w[2]} cancelled passed=- failed=- items=-" not in out:
-            fails.append(f"queue wait on a cancelled job: {rc} {out!r}")
-        rc, out, err = run("queue", "wait", w[0], "9999", *fast)
-        if rc != 2 or out or "no job #9999" not in err:
-            fails.append(f"queue wait on an unknown id must exit 2 and print no job line: {rc} {out!r} {err!r}")
-        rc, out, err = run("queue", "wait", w[3], w[0], "--interval", "1", "--timeout", "1")
-        if rc != 3 or f"job #{w[3]} queued" not in out or "(still queued)" not in out or "timed out" not in err \
-                or f"job #{w[0]} done" not in out:
-            fails.append(f"queue wait timeout must exit 3 and print the pending state: {rc} {out!r} {err!r}")
-        run("queue", "next")  # claims w[3]; w[4] stays queued behind it
-        proc = subprocess.Popen([sys.executable, me, "queue", "wait", w[3], "--interval", "1", "--timeout", "20"],
-                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        run("queue", "finish", w[3], "--status", "done")
-        for bad in ("0", "-1"):
-            rc, _, err = run("queue", "wait", w[0], "--interval", bad)
-            if rc != 2 or "at least 1" not in err:
-                fails.append(f"queue wait --interval {bad} must be refused with exit 2: {rc} {err!r}")
-        out, _ = proc.communicate(timeout=30)
-        if proc.returncode != 0 or f"job #{w[3]} done" not in out:
-            fails.append(f"queue wait must return when a running job finishes: {proc.returncode} {out!r}")
-
-        # Created items, notices and the branch of a job, added without a schema bump.
+        # Created items and notices, added without a schema bump.
         env["LEAN_BRAIN_DB"] = os.environ["LEAN_BRAIN_DB"] = os.path.join(d, "v10.db")
         con = connect()
         if con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] != "9" \
-                or not {"created", "notices"} <= {r[0] for r in con.execute("SELECT name FROM sqlite_master")} \
-                or not any(r[1] == "branch" for r in con.execute("PRAGMA table_info(jobs)")):
-            fails.append("a fresh database must stay at schema version 9 and have the created and notices tables and jobs.branch")
+                or not {"created", "notices"} <= {r[0] for r in con.execute("SELECT name FROM sqlite_master")}:
+            fails.append("a fresh database must stay at schema version 9 and have the created and notices tables")
+        names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if names & {"jobs", "runs"}:
+            fails.append(f"a fresh database must have no jobs or runs table: {sorted(names)}")
+        if not any(r[1] == "run_id" for r in con.execute("PRAGMA table_info(items)")):
+            fails.append("items must keep its run_id column")
         con.close()
         con = connect()  # a second connect is a no-op
         u = "https://github.com/o/r/pull/1"
@@ -1410,34 +846,72 @@ def run(brain_cli):
                 or out_d != f"dismissed {n1 + 1}" or f"dismissed" not in out_b:
             fails.append(f"notice list hides dismissed ones, --all shows them, dismiss reports a missing id: {out_a!r} {out_b!r} {out_c!r} {out_d!r}")
         con.close()
-        subprocess.run(["git", "-C", g, "checkout", "-q", "-b", "feat/x"], check=True, capture_output=True)
-        jb = run("queue", "add", g, "B.csproj", "--tier", "fast", "--filter", "U")[1]
-        if connect_rows(env["LEAN_BRAIN_DB"], f"SELECT branch FROM jobs WHERE id={jb}")[0]["branch"] != "feat/x":
-            fails.append("queue add must store the branch of the repo")
-        jn = run("queue", "add", os.path.join(d, "nogit"), "B.csproj", "--tier", "fast", "--filter", "U")[1]
-        if connect_rows(env["LEAN_BRAIN_DB"], f"SELECT branch FROM jobs WHERE id={jn}")[0]["branch"] != "":
-            fails.append("queue add outside git must store an empty branch")
-        v9 = os.path.join(d, "v9.db")
-        con = sq.connect(v9)
-        con.row_factory = sq.Row
-        con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        for m in MIGRATIONS[:9]:
-            m(con)
-        con.execute("INSERT INTO meta VALUES ('schema_version', '9')")
-        con.execute("INSERT INTO items (project, kind, ref, title, status, occurrences, first_seen, last_seen)"
-                    " VALUES ('p','note','r','r','open',1,'2026-10-18T00:00:00Z','2026-10-18T00:00:00Z')")
-        con.execute("INSERT INTO jobs (cycle, project, repo_dir, test_project, tier, enqueued_by, enqueued_at, status)"
-                    " VALUES ('c','p','/r','T','full','me','2026-10-18T00:00:00Z','done')")
-        con.commit()
-        con.close()
-        env["LEAN_BRAIN_DB"] = os.environ["LEAN_BRAIN_DB"] = v9
-        con = connect()
-        if con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] != "9" \
-                or con.execute("SELECT COUNT(*) FROM created").fetchone()[0] != 0 \
-                or con.execute("SELECT COUNT(*) FROM items").fetchone()[0] != 1 \
-                or con.execute("SELECT branch FROM jobs").fetchone()[0] != "":
-            fails.append("a version 9 database must gain the new tables and column, stay at 9 and keep its rows")
-        con.close()
+        # Old files keep their jobs and runs tables, row for row. Fixtures stand in for the old schema.
+        old_tables = ("CREATE TABLE runs (id INTEGER PRIMARY KEY, project TEXT NOT NULL, test_project TEXT, host TEXT)",
+                      "CREATE TABLE jobs (id INTEGER PRIMARY KEY, cycle TEXT, project TEXT NOT NULL, repo_dir TEXT,"
+                      " test_project TEXT, tier TEXT, enqueued_by TEXT, enqueued_at TEXT, status TEXT)")
+
+        def old_file(name, version):
+            path = os.path.join(d, name)
+            c = sq.connect(path)
+            c.row_factory = sq.Row
+            c.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            for m in MIGRATIONS[:version]:
+                m(c)
+            for q in old_tables:
+                c.execute(q)
+            c.execute("INSERT INTO meta VALUES ('schema_version', ?)", (str(version),))
+            c.execute("INSERT INTO items (project, kind, ref, title, status, occurrences, first_seen, last_seen)"
+                      " VALUES ('p','note','r','r','open',1,'2026-10-18T00:00:00Z','2026-10-18T00:00:00Z')")
+            c.execute("INSERT INTO runs (project, test_project, host) VALUES ('p','T','dev')")
+            c.execute("INSERT INTO jobs (cycle, project, repo_dir, test_project, tier, enqueued_by, enqueued_at, status)"
+                      " VALUES ('c','p','/r','T','full','me','2026-10-18T00:00:00Z','done')")
+            c.commit()
+            c.close()
+            return path
+
+        for name, version in (("v9.db", 9), ("v4.db", 4)):
+            path = old_file(name, version)
+            env["LEAN_BRAIN_DB"] = os.environ["LEAN_BRAIN_DB"] = path
+            con = connect()
+            con.close()
+            jobs = [tuple(r) for r in connect_rows(path, "SELECT cycle, project, repo_dir, test_project, tier,"
+                                                         " enqueued_by, enqueued_at, status FROM jobs")]
+            runs = [tuple(r) for r in connect_rows(path, "SELECT project, test_project, host FROM runs")]
+            ver = connect_rows(path, "SELECT value FROM meta WHERE key='schema_version'")[0][0]
+            n_items = connect_rows(path, "SELECT COUNT(*) FROM items")[0][0]
+            n_created = connect_rows(path, "SELECT COUNT(*) FROM created")[0][0]
+            if ver != "9" or n_items != 1 or n_created != 0 \
+                    or jobs != [("c", "p", "/r", "T", "full", "me", "2026-10-18T00:00:00Z", "done")] \
+                    or runs != [("p", "T", "dev")]:
+                fails.append(f"a version {version} database must reach 9 and keep its items, jobs and runs: "
+                             f"{ver} {n_items} {jobs} {runs}")
+
+        # The moved commands forward to test-phase. A fake one in a temp dir stands in for it.
+        fake_dir = os.path.join(d, "fakebin")
+        os.makedirs(fake_dir)
+        fake = os.path.join(fake_dir, "test-phase")
+        with open(fake, "w") as f:
+            f.write("#!/bin/sh\necho \"fake $*\"\nexit 7\n")
+        os.chmod(fake, 0o755)
+        empty_home = os.path.join(d, "emptyhome")
+        os.makedirs(empty_home)
+        empty_path = os.path.join(d, "emptybin")
+        os.makedirs(empty_path)
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "fwd.db")
+        saved_env = dict(env)
+        env["HOME"] = empty_home
+        env["PATH"] = fake_dir + os.pathsep + "/usr/bin:/bin"
+        rc, out, err = run("queue", "list", "--status", "queued")
+        if rc != 7 or out != "fake queue list --status queued" \
+                or 'brain: "brain queue" moved to "test-phase queue"' not in err:
+            fails.append(f"brain queue must run test-phase with the same arguments: {rc} {out!r} {err!r}")
+        env["PATH"] = empty_path
+        rc, out, err = run("queue", "list", "--status", "queued")
+        if rc != 2 or "test-phase was not found" not in err or out:
+            fails.append(f"with no test-phase, brain queue must exit 2 and say so: {rc} {out!r} {err!r}")
+        env.clear()
+        env.update(saved_env)
         # The calls lean-agent-tools makes through the brain command.
         env["LEAN_BRAIN_DB"] = os.path.join(d, "contract.db")
         rc, out, _ = run("--version")

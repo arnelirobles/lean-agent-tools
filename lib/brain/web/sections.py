@@ -25,7 +25,7 @@ NEEDS_KINDS = ("question", "blocker", "pending", "risk")
 _RECOMMEND = re.compile(r"recommend(?:ed|ation)?\s*:", re.I)
 WORKTREE_TTL = 90
 _REPOS = {}  # folder to (expiry, repo_of), kept across page loads so git runs once per folder per TTL
-_SECTIONS = ("needs_you", "flaky", "queue", "created", "tickets", "worktrees", "tested", "notices", "usage", "decided")
+_SECTIONS = ("needs_you", "flaky", "created", "tickets", "worktrees", "notices", "usage", "decided")
 
 
 def recommendation(body) -> str:
@@ -53,16 +53,6 @@ def _flaky(con):
                       "GROUP BY project ORDER BY n DESC, project")
 
 
-def _queue(con):
-    cols = ("j.id, j.project, j.test_project, j.tier, j.status, j.reason, j.branch, j.platform, j.host, "
-            "j.enqueued_at, j.started_at, j.ended_at, r.passed, r.failed")
-    live = _rows(con, f"SELECT {cols} FROM jobs j LEFT JOIN runs r ON r.id=j.run_id "
-                      "WHERE j.status IN ('queued','running') ORDER BY j.status DESC, j.priority DESC, j.id")
-    ended = _rows(con, f"SELECT {cols} FROM jobs j LEFT JOIN runs r ON r.id=j.run_id "
-                       "WHERE j.status NOT IN ('queued','running') ORDER BY j.id DESC LIMIT 20")
-    return live + ended
-
-
 def _created(con, cache, run=None):
     rows = _rows(con, "SELECT id, kind, forge, repo, branch, url, number, title, session_id, cwd, created_at, state "
                       "FROM created ORDER BY id DESC LIMIT 100")
@@ -78,28 +68,6 @@ def _created(con, cache, run=None):
                          lambda r=r: forges.pr_state(r["forge"], r["repo"], r["number"], **kw))
         r["pr_state"] = "checking" if got is None else (got or r["state"])
     return rows
-
-
-def _tested(con, created, repo_of):
-    out = []
-    for c in created:
-        if c["kind"] != "pr":
-            continue
-        row = {"number": c["number"], "repo": c["repo"], "branch": c["branch"], "url": c["url"],
-               "state": c["pr_state"], "run_id": None, "passed": None, "failed": None, "passing": False, "flag": ""}
-        mine = repo_of(c["cwd"])
-        if mine and c["branch"]:
-            jobs = _rows(con, "SELECT j.repo_dir, r.id AS run_id, r.passed, r.failed, r.stalled, r.exit_code "
-                              "FROM jobs j JOIN runs r ON r.id=j.run_id WHERE j.branch=? ORDER BY r.id DESC",
-                         (c["branch"],))
-            hits = [j for j in jobs if (theirs := repo_of(j["repo_dir"])) and theirs[1] == mine[1]]
-            if hits:
-                row.update(run_id=hits[0]["run_id"], passed=hits[0]["passed"], failed=hits[0]["failed"])
-                row["passing"] = any(not j["failed"] and j["passed"] and not j["stalled"] for j in hits)
-        if c["pr_state"] == "merged" and not row["passing"]:
-            row["flag"] = "merged untested"
-        out.append(row)
-    return out
 
 
 def _decided(con):
@@ -172,13 +140,7 @@ def collect(con, cache, roots, which=None, run=None) -> dict:
 
     guard("needs_you", lambda: _needs_you(con))
     guard("flaky", lambda: _flaky(con))
-    guard("queue", lambda: _queue(con))
     guard("created", lambda: _created(con, cache, run))
-    def tested():
-        if "created" in data["errors"]:
-            raise RuntimeError(data["errors"]["created"])
-        return _tested(con, data["created"], repo_of)
-    guard("tested", tested)
     guard("decided", lambda: _decided(con))
     guard("notices", lambda: _notices(con))
 

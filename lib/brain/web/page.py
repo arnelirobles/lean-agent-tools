@@ -82,15 +82,6 @@ def _needs(data, key):
     return out
 
 
-def _queue(data):
-    rows = []
-    for j in data.get("queue", []):
-        result = "" if j.get("passed") is None else f'{e(j["passed"])} passed, {e(j["failed"])} failed'
-        rows.append([e(j["id"]), e(j.get("status")), e(j.get("project")), e(j.get("test_project")), e(j.get("tier")),
-                     e(j.get("branch")), e(j.get("platform")), result, e(j.get("reason"))])
-    return _table(["Job", "Status", "Project", "Test", "Tier", "Branch", "Lane", "Result", "Reason"], rows)
-
-
 def _created(data):
     rows = []
     for c in data.get("created", []):
@@ -119,15 +110,6 @@ def _trees(data):
     return _table(["Repo", "Path", "Branch", "State", ""], rows)
 
 
-def _tested(data):
-    rows = []
-    for t in data.get("tested", []):
-        run = "no run" if t.get("run_id") is None else f'run {e(t["run_id"])}: {e(t["passed"])} passed, {e(t["failed"])} failed'
-        flag = f'<span class="flag">{e(t["flag"])}</span>' if t.get("flag") else ""
-        rows.append([link(t.get("url"), f'{t.get("repo")} #{t.get("number")}'), e(t.get("branch")), e(t.get("state")), run, flag])
-    return _table(["PR", "Branch", "State", "Last run", ""], rows)
-
-
 def _notices(data, key):
     rows = [[e(n.get("hook")), e(n.get("text")), e(n.get("created_at")),
              _form("/dismiss", key, [("id", n["id"])], "Dismiss")] for n in data.get("notices", [])]
@@ -151,11 +133,9 @@ def render(data: dict, key: str, port: int) -> str:
         f"<title>lean brain</title><style>{CSS}</style></head><body><h1>lean brain</h1>"
         f'<p>updated {time.strftime("%H:%M")} <a href="/">Refresh</a></p>',
         _section("Needs you", err, "needs_you", _needs(data, key), "Nothing is waiting on you."),
-        _section("Test queue", err, "queue", _queue(data), "The queue is empty."),
         _section("Created by agents", err, "created", _created(data), "Nothing created yet."),
         _section("Pending tickets", err, "tickets", _tickets(data), "No open tickets assigned to you."),
         _section("Worktrees", err, "worktrees", _trees(data), "No worktrees found."),
-        _section("Tested or not", err, "tested", _tested(data), "No pull requests to check."),
         _section("Notices", err, "notices", _notices(data, key), "No notices."),
         _section("Usage", err, "usage", _usage(data), "No usage data."),
         _section("Decided", err, "decided", _decided(data), "Nothing decided yet."),
@@ -207,9 +187,6 @@ def _self_test() -> int:
                 "VALUES ('pr','github','o/r','feat','https://github.com/o/r/pull/1',1,'t',?, 'merged', ?)", (ts, repo))
     con.execute("INSERT INTO created (kind, forge, repo, branch, url, number, title, created_at, state, cwd) "
                 "VALUES ('pr','github','o/r','tested','javascript:alert(1)',2,'u',?, 'open', ?)", (ts, repo))
-    con.execute("INSERT INTO runs (project, test_project, passed, failed, started) VALUES ('p','t',5,0,1)")
-    con.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at, run_id, branch) "
-                "VALUES ('p', ?, 't', 'done', ?, 1, 'tested')", (repo, ts))
     con.commit()
 
     nowhere = lambda n: None
@@ -236,9 +213,6 @@ def _self_test() -> int:
     check("recommendation is after the last marker", q1["recommendation"], "use B")
     check("can_send", q1["can_send"], True)
     check("decided", sorted(d["ref"] for d in data["decided"]), ["q3", "r1"])
-    flags = {t["number"]: (t["flag"], t["passing"], t["run_id"]) for t in data["tested"]}
-    check("merged untested", flags[1], ("merged untested", False, None))
-    check("tested pr passes", flags[2], ("", True, 1))
     check("gh missing note", "gh is not installed" in data["errors"].get("tickets", ""), True)
     check("usage error not crash", "usage" in data["errors"], True)
     check("usage error is no data, not a missing script", "no data yet" in data["errors"].get("usage", ""), True)
@@ -246,8 +220,8 @@ def _self_test() -> int:
     check("script escaped", "<script>alert(1)</script>" not in page and "&lt;script&gt;alert(1)&lt;/script&gt;" in page, True)
     check("notice escaped", "&lt;b&gt;note&lt;/b&gt;" in page, True)
     check("flaky lines", page.count("flaky items in"), 2)
+    check("no queue or run section", ("Test queue" in page, "Tested or not" in page), (False, False))
     check("no row per flaky", "flaky 100" in page, False)
-    check("merged untested shown", "merged untested" in page, True)
     check("gh note shown", "gh is not installed" in page, True)
     check("no auto refresh", "http-equiv" in page, False)
     check("refresh link", ('<a href="/">Refresh</a>' in page, "updated " in page), (True, True))
@@ -320,7 +294,7 @@ def _self_test() -> int:
     d2 = sections.collect(c2, forges.Cache(), [], which=nowhere)
     took = time.monotonic() - t0
     check("locked collect under 3s", took < 3, True)
-    check("locked errors filled", all(k in d2["errors"] for k in ("needs_you", "queue", "created", "decided")), True)
+    check("locked errors filled", all(k in d2["errors"] for k in ("needs_you", "created", "decided")), True)
     check("locked page renders", "lean brain" in render(d2, "k", 1) and "locked" in render(d2, "k", 1), True)
     lock.execute("ROLLBACK")
     lock.close()

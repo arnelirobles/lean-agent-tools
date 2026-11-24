@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 TEST_PHASE = os.path.join(HERE, "test-phase")
@@ -395,6 +396,28 @@ def self_test():
             err, text = call("queue_list", status="done")
             if err or text != "no done jobs":
                 fails.append(f"an empty queue_list must name the status asked for: {err} {text!r}")
+            import sqlite3
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            tdb = sqlite3.connect(env["LEAN_TESTS_DB"])
+            for i in range(300):
+                tdb.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) "
+                            "VALUES ('big1', '/x', ?, 'done', ?)", ("t/Done%d.csproj" % i, stamp))
+            tdb.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) "
+                        "VALUES ('big1', '/x', 't/Running.csproj', 'running', ?)", (stamp,))
+            tdb.commit()
+            tdb.close()
+            err, text = call("queue_list")
+            lines = text.splitlines()
+            if err or "Running.csproj" not in text or "Done" in text or "tests/A.csproj" not in text \
+                    or "Running.csproj" not in lines[0]:
+                fails.append(f"queue_list default must list running before queued and leave out done: {err} {text[:300]!r}")
+            err, text = call("queue_list", limit=None)
+            if err or "Running.csproj" not in text.splitlines()[0]:
+                fails.append(f"a null limit means no limit, and running jobs come first: {err} {text[:200]!r}")
+            err, text = call("queue_list", status="done")
+            if err or "Done299.csproj" not in text or len(text.splitlines()) != 51 \
+                    or "more jobs" not in text.splitlines()[-1]:
+                fails.append(f"queue_list status done must list done jobs, cut at 50: {err} {len(text.splitlines())}")
             err, text = call("queue_cancel", id="one")
             if not err:
                 fails.append("a non-integer id must be isError")

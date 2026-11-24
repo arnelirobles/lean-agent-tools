@@ -1,6 +1,8 @@
 import calendar
 import os
+import re
 import sqlite3
+import subprocess
 import sys
 import time
 
@@ -70,14 +72,7 @@ def migrate_1(con):  # the first layout: one flat table
         closed_at TEXT, note TEXT NOT NULL DEFAULT '')""")
 
 
-def migrate_2(con):  # items, tags and runs; carries over rows from the flat table
-    con.execute("""CREATE TABLE runs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, cycle TEXT NOT NULL DEFAULT '', project TEXT NOT NULL,
-        repo TEXT NOT NULL DEFAULT '', test_project TEXT NOT NULL DEFAULT '', runner TEXT NOT NULL DEFAULT '',
-        tier TEXT NOT NULL DEFAULT 'full', started INTEGER, ended INTEGER, duration_s REAL,
-        lane_wait_s REAL, load_start REAL, load_end REAL, passed INTEGER NOT NULL DEFAULT 0,
-        failed INTEGER NOT NULL DEFAULT 0, skipped INTEGER NOT NULL DEFAULT 0,
-        stalled INTEGER NOT NULL DEFAULT 0, exit_code INTEGER)""")
+def migrate_2(con):  # items and tags; carries over rows from the flat table
     con.execute("""CREATE TABLE items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         project TEXT NOT NULL, repo TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL DEFAULT '',
@@ -85,12 +80,11 @@ def migrate_2(con):  # items, tags and runs; carries over rows from the flat tab
         status TEXT NOT NULL DEFAULT 'open', resolution TEXT NOT NULL DEFAULT '',
         severity TEXT NOT NULL DEFAULT '', phase TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '',
         model TEXT NOT NULL DEFAULT '', cycle TEXT NOT NULL DEFAULT '', commit_hash TEXT NOT NULL DEFAULT '',
-        link TEXT NOT NULL DEFAULT '', run_id INTEGER REFERENCES runs(id), occurrences INTEGER NOT NULL DEFAULT 1,
+        link TEXT NOT NULL DEFAULT '', run_id INTEGER, occurrences INTEGER NOT NULL DEFAULT 1,
         first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, closed_at TEXT)""")
     con.execute("CREATE TABLE tags (item_id INTEGER NOT NULL REFERENCES items(id), tag TEXT NOT NULL, "
                 "PRIMARY KEY (item_id, tag))")
     con.execute("CREATE INDEX items_key ON items (project, kind, ref, status)")
-    con.execute("CREATE INDEX runs_test ON runs (test_project)")
     if con.execute("SELECT name FROM sqlite_master WHERE name='entries'").fetchone():
         for r in con.execute("SELECT * FROM entries ORDER BY id").fetchall():
             kind = "test-fail" if r["kind"] == "test-failure" else r["kind"]
@@ -102,19 +96,12 @@ def migrate_2(con):  # items, tags and runs; carries over rows from the flat tab
         con.execute("DROP TABLE entries")
 
 
-def migrate_3(con):  # the queue test-phase drains
-    con.execute("""CREATE TABLE jobs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, cycle TEXT NOT NULL DEFAULT '', project TEXT NOT NULL,
-        repo_dir TEXT NOT NULL, test_project TEXT NOT NULL, filter TEXT NOT NULL DEFAULT '',
-        tier TEXT NOT NULL DEFAULT 'full', after_id INTEGER REFERENCES jobs(id),
-        status TEXT NOT NULL DEFAULT 'queued', reason TEXT NOT NULL DEFAULT '',
-        enqueued_by TEXT NOT NULL DEFAULT '', enqueued_at TEXT NOT NULL, started_at TEXT, ended_at TEXT,
-        run_id INTEGER REFERENCES runs(id))""")
-    con.execute("CREATE INDEX jobs_status ON jobs (status, id)")
+def migrate_3(con):  # the job queue moved to tests.db; an existing jobs table stays as it is
+    return
 
 
-def migrate_4(con):  # extra arguments for the test command, per job
-    con.execute("ALTER TABLE jobs ADD COLUMN args TEXT NOT NULL DEFAULT ''")
+def migrate_4(con):  # nothing to do on a fresh file
+    return
 
 
 def migrate_5(con):  # the session that filed an item and its folder, so an answer can resume it
@@ -125,24 +112,26 @@ def migrate_5(con):  # the session that filed an item and its folder, so an answ
         started_at TEXT NOT NULL, ended_at TEXT NOT NULL DEFAULT '')""")
 
 
-def migrate_6(con):  # a bumped job runs before the rest of the queue
-    con.execute("ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+def migrate_6(con):  # nothing to do on a fresh file
+    return
 
 
-def migrate_7(con):  # which platform a job needs, and which host ran a job or a run
-    con.execute("ALTER TABLE jobs ADD COLUMN platform TEXT NOT NULL DEFAULT ''")
-    con.execute("ALTER TABLE jobs ADD COLUMN host TEXT NOT NULL DEFAULT ''")
-    con.execute("ALTER TABLE runs ADD COLUMN host TEXT NOT NULL DEFAULT ''")
-    # Platform was not detected before this step; unknown means local only.
-    con.execute("UPDATE jobs SET platform='apple' WHERE status IN ('queued','running')")
+def migrate_7(con):  # nothing to do on a fresh file
+    return
 
 
-def migrate_8(con):  # the repo HEAD a job was queued at, so a full run is not repeated for one commit
-    con.execute("ALTER TABLE jobs ADD COLUMN commit_hash TEXT NOT NULL DEFAULT ''")
+def migrate_8(con):  # nothing to do on a fresh file
+    return
 
 
-def migrate_9(con):  # lower case projects, a fixed list of kinds, and the session that queued a job
+def has_table(con, name):
+    return bool(con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone())
+
+
+def migrate_9(con):  # lower case projects and a fixed list of kinds
     for table in ("items", "runs", "jobs"):  # in Python, because SQLite LOWER() leaves non-ASCII letters alone
+        if not has_table(con, table):
+            continue
         for r in con.execute(f"SELECT DISTINCT project FROM {table}").fetchall():
             if norm_project(r["project"]) != r["project"]:
                 con.execute(f"UPDATE {table} SET project=? WHERE project=?", (norm_project(r["project"]), r["project"]))
@@ -168,8 +157,9 @@ def migrate_9(con):  # lower case projects, a fixed list of kinds, and the sessi
                 if not keep[col] and r[col]:
                     con.execute(f"UPDATE items SET {col}=? WHERE id=?", (r[col], keep["id"]))
             con.execute("DELETE FROM items WHERE id=?", (r["id"],))
-    con.execute("ALTER TABLE jobs ADD COLUMN session_id TEXT NOT NULL DEFAULT ''")
-    con.execute("ALTER TABLE jobs ADD COLUMN session_cwd TEXT NOT NULL DEFAULT ''")
+    if has_table(con, "jobs"):  # an old file keeps its jobs for the one-time copy into tests.db
+        con.execute("ALTER TABLE jobs ADD COLUMN session_id TEXT NOT NULL DEFAULT ''")
+        con.execute("ALTER TABLE jobs ADD COLUMN session_cwd TEXT NOT NULL DEFAULT ''")
 
 
 def ensure_extras(con):
@@ -199,7 +189,7 @@ def ensure_extras(con):
         created_at TEXT NOT NULL,
         dismissed_at TEXT NOT NULL DEFAULT ''
     )""")
-    if not any(r[1] == "branch" for r in con.execute("PRAGMA table_info(jobs)")):
+    if has_table(con, "jobs") and not any(r[1] == "branch" for r in con.execute("PRAGMA table_info(jobs)")):
         con.execute("ALTER TABLE jobs ADD COLUMN branch TEXT NOT NULL DEFAULT ''")
 
 
@@ -236,7 +226,8 @@ def connect(migrate=True, timeout=30):
             raise
     if migrate:
         have = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE name IN ('created','notices')")}
-        if have != {"created", "notices"} or not any(r[1] == "branch" for r in con.execute("PRAGMA table_info(jobs)")):
+        no_branch = has_table(con, "jobs") and not any(r[1] == "branch" for r in con.execute("PRAGMA table_info(jobs)"))
+        if have != {"created", "notices"} or no_branch:
             con.execute("BEGIN IMMEDIATE")
             try:
                 ensure_extras(con)
@@ -246,6 +237,19 @@ def connect(migrate=True, timeout=30):
                 raise
     con.isolation_level = ""  # the rest of brain relies on `with con:` opening and committing a transaction
     return con
+
+
+def project_of(path):
+    """The main repository's name, so a worktree and its repository are one project."""
+    path = os.path.abspath(path)
+    r = subprocess.run(["git", "-C", path if os.path.isdir(path) else os.path.dirname(path), "rev-parse",
+                        "--git-common-dir"], capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        common = os.path.abspath(os.path.join(path, r.stdout.strip()))
+        name = os.path.basename(common)
+        name = os.path.basename(os.path.dirname(common)) if name == ".git" else re.sub(r"\.git$", "", name)
+        return name.lower()
+    return os.path.basename(path.rstrip("/")).lower()
 
 
 def now():

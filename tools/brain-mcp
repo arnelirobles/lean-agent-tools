@@ -5,13 +5,11 @@ Newline-delimited JSON-RPC 2.0, Python 3 standard library only. Every tool runs 
 next to this script as a subprocess with an argument list (never a shell), so the schema and the rules
 stay in one place. A nonzero exit becomes a tool result with isError true and the stderr text.
 
-Tools: brain_list, brain_show, brain_add, brain_close, brain_queue_list, brain_queue_add,
-brain_queue_cancel, brain_queue_bump, brain_queue_route, brain_stats, brain_digest. `queue next` and `queue finish` are not exposed:
-only the drainer (tools/test-phase) claims and finishes jobs.
+Tools: brain_list, brain_show, brain_add, brain_close, brain_stats, brain_digest. The test queue tools are
+served by tools/tests-mcp.
 
 brain_list answers small by default: open items, newest first, 50 lines (the limit argument changes that, and
-a status or open=false asks for more). brain_queue_list defaults to queued and running jobs. A cut says how
-many more exist. brain_digest is the short start-of-session read.
+a status or open=false asks for more). A cut says how many more exist. brain_digest is the short start-of-session read.
 
 A body goes to brain on stdin (--body-file -), never on the command line.
 BRAIN_MCP_ARGV_LOG=FILE appends the argv of every brain call to FILE as one JSON line (used by the
@@ -20,7 +18,6 @@ self-test to prove a body never reaches argv). Logs go to stderr only.
   brain-mcp --self-test
 """
 import json
-import re
 import os
 import subprocess
 import sys
@@ -127,20 +124,6 @@ def after_list(a, text):
     return cut(list(reversed(text.splitlines())), limit_of(a), "items")
 
 
-def after_queue_list(a, text):
-    status = a.get("status")
-    if not status:
-        # Running jobs, then queued ones in the order the drainer takes them, so a cut drops the last to run.
-        extra = ["--cycle=" + a["cycle"]] if a.get("cycle") else []
-        rc, out, _ = run_brain(["queue", "list", "--status=queued", *extra], None)
-        lines = text.splitlines() + (out.splitlines() if rc == 0 else [])
-    elif status in ("queued", "running"):
-        lines = text.splitlines()
-    else:
-        lines = list(reversed(text.splitlines()))
-    return cut(lines, limit_of(a), "jobs") or (f"no {status} jobs" if status else "no queued or running jobs")
-
-
 def after_stats(a, text):
     lines = text.splitlines()
     return cut(lines, len(lines), "lines")
@@ -184,55 +167,6 @@ def t_close(a):
     return args, None
 
 
-def t_queue_list(a):
-    limit_of(a)
-    args = ["queue", "list"]
-    if not a.get("status"):
-        args.append("--status=running")  # after_queue_list adds the queued jobs in drainer order
-    opt(a, args, "status")
-    opt(a, args, "cycle")
-    return args, None
-
-
-CLASS = re.compile(r"[A-Za-z0-9_.*~`+<>]+")
-
-
-def t_queue_add(a):
-    args = ["queue", "add", need_str(a, "repo_dir"), need_str(a, "test_project"), "--by", "mcp", "--infer-session"]
-    # test-phase splits a filter on | and hands each piece to dotnet, so check each piece, not the whole.
-    f = a.get("filter")
-    if f not in (None, "") and not (isinstance(f, str) and all(CLASS.fullmatch(p.strip()) for p in f.split("|"))):
-        raise Bad("filter must be class names joined by |")
-    if a.get("tier") not in (None, "", "fast", "full"):
-        raise Bad("tier must be fast or full")
-    for k in ("filter", "tier", "cycle", "again"):
-        opt(a, args, k)
-    opt(a, args, "after", kind=int)
-    # No extra dotnet arguments here: they run on the drainer's machine, so they stay a shell-only choice.
-    # Only the top of a git work tree: a queued job builds and runs that folder's code, and a remote
-    # lane copies its files, so a scratch folder somewhere is not a place to queue from.
-    top = subprocess.run(["git", "-C", args[2], "rev-parse", "--show-toplevel"], capture_output=True, text=True)
-    if not os.path.isdir(args[2]) or top.returncode != 0 or \
-            os.path.realpath(top.stdout.strip()) != os.path.realpath(args[2]):
-        raise Bad("repo_dir must be the top folder of a git work tree")
-    return args, None
-
-
-def t_queue_cancel(a):
-    return ["queue", "cancel", need_int(a, "id")], None
-
-
-def t_queue_bump(a):
-    return ["queue", "bump", need_int(a, "id")], None
-
-
-def t_queue_route(a):
-    to = need_str(a, "to")
-    if to not in ("remote", "local", "any"):
-        raise Bad("to must be remote, local or any")
-    return ["queue", "route", need_int(a, "id"), "--to=" + to], None
-
-
 def t_digest(a):
     args = ["digest"]
     if a.get("all") is True:
@@ -261,30 +195,14 @@ TOOLS = [
     ("brain_close", "Close an item. Needs a resolution, or wontfix.", t_close, schema({
         "id": I("item id"), "resolution": S("fixed, flaky, flaky-cleared, not-a-bug, duplicate, answered or filed"),
         "note": S("closing note"), "wontfix": B("close as wontfix")}, ["id"])),
-    ("brain_queue_list", "List test queue jobs: queued and running unless status says otherwise, newest first, "
-     "50 at most.", t_queue_list, schema({
-        "limit": I("most lines to return, default 50"),
-        "status": S("queued, running, done, failed or cancelled"), "cycle": S("cycle name")})),
-    ("brain_queue_add", "Queue a test job. Returns the job id at once, the id of the identical queued job when there is one; do not wait for it.", t_queue_add, schema({
-        "repo_dir": S("repository folder"), "test_project": S("test project path"), "filter": S("test filter"),
-        "tier": S("fast or full"), "after": I("job id this one waits for"), "cycle": S("cycle name"),
-        "again": S("reason to run a full job again for a commit that already has one, or from a dirty tree")},
-        ["repo_dir", "test_project"])),
-    ("brain_queue_cancel", "Cancel a queued job and the jobs waiting on it.", t_queue_cancel,
-     schema({"id": I("job id")}, ["id"])),
-    ("brain_queue_bump", "Move a queued job, and the jobs chained after it, ahead of the rest.", t_queue_bump,
-     schema({"id": I("job id")}, ["id"])),
-    ("brain_queue_route", "Choose which lanes may run a queued job: remote (only a remote host such as the VM), "
-     "local (only this machine) or any.", t_queue_route,
-     schema({"id": I("job id"), "to": S("remote, local or any")}, ["id", "to"])),
     ("brain_digest", "Short read for the start of a session, under 2 KB: open counts by project and kind, open "
-     "blockers and questions, running jobs, stale agents. The current project unless project or all is given.",
+     "blockers and questions, stale agents. The current project unless project or all is given.",
      t_digest, schema({"project": S("project name, matched without regard to case"),
                        "all": B("every project")})),
-    ("brain_stats", "Run counts, flaky rate and durations as JSON.", t_stats, schema({})),
+    ("brain_stats", "Item counts by kind and status, open items by project, stale agents and median time to close, as JSON.", t_stats, schema({})),
 ]
 BY_NAME = {n: f for n, _, f, _ in TOOLS}
-AFTER = {"brain_list": after_list, "brain_queue_list": after_queue_list, "brain_stats": after_stats}
+AFTER = {"brain_list": after_list, "brain_stats": after_stats}
 
 
 def run_brain(args, stdin):
@@ -385,11 +303,6 @@ def digest_and_size_tests(fails, call, db):
     rows.append(("big1", "agent", "oldagent", "stale one", "open", "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z"))
     con.executemany("INSERT INTO items (project, kind, ref, title, status, first_seen, last_seen) "
                     "VALUES (?,?,?,?,?,?,?)", rows)
-    for i in range(300):
-        con.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) "
-                    "VALUES ('big1', '/x', ?, 'done', ?)", ("t/Done%d.csproj" % i, now))
-    con.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) "
-                "VALUES ('big1', '/x', 't/Running.csproj', 'running', ?)", (now,))
     con.commit()
     con.close()
     err, text = call("brain_list")
@@ -416,19 +329,6 @@ def digest_and_size_tests(fails, call, db):
     err, text = call("brain_list", open=False, project="Big0", limit=1000)
     if err or " closed " not in text:
         fails.append(f"brain_list open=false must include closed items: {err}")
-    err, text = call("brain_queue_list")
-    if err or "Running.csproj" not in text or "Done" in text or "tests/A.csproj" not in text:
-        fails.append(f"brain_queue_list default must be queued and running jobs only: {err} {text[:300]!r}")
-    err, text = call("brain_queue_bump", id=2)
-    err, text = call("brain_queue_list", status="queued", limit=1)
-    if err or not text.startswith("job #2 "):
-        fails.append(f"a cut brain_queue_list must keep the next job to run first: {err} {text!r}")
-    err, text = call("brain_queue_list", limit=None)
-    if err or not text.splitlines()[0].startswith("job ") or "Running.csproj" not in text.splitlines()[0]:
-        fails.append(f"a null limit means no limit given, and running jobs come first: {err} {text[:200]!r}")
-    err, text = call("brain_queue_list", status="cancelled")
-    if err or text != "no cancelled jobs":
-        fails.append(f"an empty brain_queue_list must name the status asked for: {err} {text!r}")
     con = sqlite3.connect(db)
     con.execute("INSERT INTO items (project, kind, ref, title, status, cycle, first_seen, last_seen) "
                 "VALUES ('Cyc', 'test-fail', 'c1', 't', 'closed', 'c9', ?, ?)", (now, now))
@@ -437,12 +337,8 @@ def digest_and_size_tests(fails, call, db):
     err, text = call("brain_list", cycle="c9")
     if err or " closed " not in text:
         fails.append(f"brain_list with a cycle must not default to open items: {err} {text!r}")
-    err, text = call("brain_queue_list", status="done")
-    if err or "Done299.csproj" not in text or len(text.splitlines()) != 51 or "more jobs" not in text.splitlines()[-1]:
-        fails.append(f"brain_queue_list status done must list done jobs, cut at 50: {err} {len(text.splitlines())}")
     err, text = call("brain_digest", project="big1")
-    if err or len(text.encode()) > 2048 or "waiting on the user" not in text or "stale agent" not in text \
-            or "Running.csproj" not in text or "Done" in text:
+    if err or len(text.encode()) > 2048 or "waiting on the user" not in text or "stale agent" not in text:
         fails.append(f"brain_digest for one project: {err} {len(text.encode())} bytes {text!r}")
     err, text = call("brain_digest", all=True)
     if err or len(text.encode()) > 2048 or "big0" not in text:
@@ -479,7 +375,8 @@ def self_test():
     with tempfile.TemporaryDirectory() as d:
         d_root = d
         argv_log = os.path.join(d, "argv.log")
-        env = dict(os.environ, LEAN_BRAIN_DB=os.path.join(d, "brain.db"), BRAIN_MCP_ARGV_LOG=argv_log)
+        env = dict(os.environ, LEAN_BRAIN_DB=os.path.join(d, "brain.db"), LEAN_TESTS_DB=os.path.join(d, "tests.db"),
+                   BRAIN_MCP_ARGV_LOG=argv_log)
         env.pop("LEAN_SESSION_ID", None)
         env.pop("LEAN_SESSION_CWD", None)
         p = subprocess.Popen([sys.executable, me], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -512,8 +409,7 @@ def self_test():
             if rpc("ping").get("result") != {}:
                 fails.append("ping must return {}")
             names = {t["name"] for t in rpc("tools/list").get("result", {}).get("tools", [])}
-            want = {"brain_list", "brain_show", "brain_add", "brain_close", "brain_queue_list", "brain_queue_add",
-                    "brain_queue_cancel", "brain_queue_bump", "brain_queue_route", "brain_stats", "brain_digest"}
+            want = {"brain_list", "brain_show", "brain_add", "brain_close", "brain_stats", "brain_digest"}
             if names != want:
                 fails.append(f"tools/list: missing {sorted(want - names)} extra {sorted(names - want)}")
             err, text = call("brain_add", project="demo", kind="question", ref="q1", title="a title",
@@ -541,50 +437,6 @@ def self_test():
             err, text = call("brain_add", project="demo", kind="note", ref="q2", title="-1 offset in the parser")
             if err:
                 fails.append(f"a title may start with a dash: {text!r}")
-            repo = os.path.join(d, "repo")
-            os.makedirs(os.path.join(repo, "sub"))
-            subprocess.run(["git", "init", "-q", repo], check=True)
-            for not_top in (d, os.path.join(repo, "sub")):
-                err, text = call("brain_queue_add", repo_dir=not_top, test_project="tests/A.csproj")
-                if not err:
-                    fails.append(f"brain_queue_add must refuse a folder that is not a git top folder: {not_top}")
-            d = repo
-            os.makedirs(os.path.join(d, "tests"))
-            with open(os.path.join(d, "tests", "A.csproj"), "w") as f:
-                f.write("<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>")
-            err, text = call("brain_queue_add", repo_dir=d, test_project="tests/A.csproj", filter="X", tier="fast")
-            if err:
-                fails.append(f"brain_queue_add: {text!r}")
-            err2, text2 = call("brain_queue_add", repo_dir=d, test_project="tests/A.csproj", filter="X", tier="fast")
-            if err2 or text2 != text:
-                fails.append(f"brain_queue_add must return the id of an identical queued job: {text!r} {text2!r}")
-            for bad in ({"repo_dir": d, "test_project": "--help"}, {"repo_dir": d, "test_project": "t", "filter": "-x"},
-                        {"repo_dir": d, "test_project": "t", "filter": "A| --help"},
-                        {"repo_dir": d, "test_project": "t", "tier": "slow"},
-                        {"repo_dir": os.path.join(d, "nope"), "test_project": "t"},
-                        {"repo_dir": d, "test_project": "t", "args": "-p:X=1"}):
-                err, text = call("brain_queue_add", **bad)
-                if not err and "args" not in bad:
-                    fails.append(f"brain_queue_add must refuse {bad}: {text!r}")
-            if "--args" in open(argv_log).read():
-                fails.append("brain_queue_add must never pass --args")
-            err, text = call("brain_queue_route", id=1, to="remote")
-            if err or "platform=remote" not in text:
-                fails.append(f"brain_queue_route must send a queued job to a remote lane: {err} {text!r}")
-            call("brain_queue_add", repo_dir=d, test_project="tests/Mac.csproj")  # unreadable, so queued as apple
-            err, text = call("brain_queue_route", id=2, to="remote")
-            if not err or "--force" not in text:
-                fails.append(f"brain_queue_route must refuse sending an apple job to a remote lane: {err} {text!r}")
-            err, text = call("brain_queue_add", repo_dir=d, test_project="tests/A.csproj", again="a reason")
-            if err or "--again=a reason" not in open(argv_log).read():
-                fails.append(f"brain_queue_add must pass again through: {err} {text!r}")
-            for bad in ({"id": 1, "to": "vm"}, {"id": 1, "to": "--help"}, {"id": 1}):
-                err, text = call("brain_queue_route", **bad)
-                if not err:
-                    fails.append(f"brain_queue_route must refuse {bad}: {text!r}")
-            err, text = call("brain_queue_list")
-            if err or "tests/A.csproj" not in text:
-                fails.append(f"brain_queue_list must show the job: {err} {text!r}")
             digest_and_size_tests(fails, call, os.path.join(d_root, "brain.db"))
             long_title_tests(fails, call, os.path.join(d_root, "brain.db"))
             err, text = call("brain_stats")
@@ -596,9 +448,9 @@ def self_test():
             err, text = call("brain_show", id="one")
             if not err:
                 fails.append("a non-integer id must be isError")
-            r = rpc("tools/call", {"name": "brain_queue_next", "arguments": {}})
+            r = rpc("tools/call", {"name": "brain_queue_list", "arguments": {}})
             if "error" not in r:
-                fails.append("queue next must not be exposed")
+                fails.append("the queue tools must not be exposed")
             r = rpc("nope/nothing")
             if r.get("error", {}).get("code") != -32601:
                 fails.append(f"unknown method must be -32601: {r}")
@@ -616,11 +468,8 @@ def self_test():
                 fails.append("the body reached a brain argv")
             if "--body-file" not in logged or '"-"' not in logged:
                 fails.append("brain_add must pass --body-file -")
-            if '"mcp"' not in logged:
-                fails.append("queue add must pass --by mcp")
-            for bad in ('"next"', '"finish"'):
-                if bad in logged:
-                    fails.append(f"argv log has {bad}")
+            if '"queue"' in logged:
+                fails.append("a queue call reached brain")
         else:
             fails.append("no argv log written")
     if fails:

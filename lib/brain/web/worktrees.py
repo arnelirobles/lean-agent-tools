@@ -46,7 +46,7 @@ def repo_of(path, run=subprocess.run):
 def candidate_paths(con, roots) -> list:
     """Folders the brain has seen, plus the folders inside each root. Reads the database, runs no git."""
     paths = []
-    for sql in ("SELECT repo_dir FROM jobs", "SELECT session_cwd FROM items", "SELECT cwd FROM sessions"):
+    for sql in ("SELECT session_cwd FROM items", "SELECT cwd FROM sessions"):
         try:
             paths += [r[0] for r in con.execute(sql).fetchall()]
         except Exception:
@@ -193,10 +193,9 @@ def _self_test() -> int:
     plain = os.path.join(base, "roots", "plain")
     os.makedirs(plain)
     con = sqlite3.connect(":memory:")
-    con.execute("CREATE TABLE jobs (repo_dir TEXT, branch TEXT)")
     con.execute("CREATE TABLE items (session_cwd TEXT)")
     con.execute("CREATE TABLE sessions (cwd TEXT)")
-    con.execute("INSERT INTO jobs VALUES (?, 'x')", (main,))
+    con.execute("INSERT INTO items VALUES (?)", (main,))
     con.execute("INSERT INTO items VALUES (?)", (wt1,))
     con.execute("INSERT INTO items VALUES (?)", (wt3,))
     con.execute("INSERT INTO items VALUES (NULL)")
