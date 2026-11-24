@@ -4,7 +4,7 @@
 SessionStart. The mode is the first argument, else $CLAUDE_PLUGIN_OPTION_SERVE_MODE (the plugin's serve_mode
 setting), else manual; any other value is manual and noted once. session: start `brain serve --idle-exit 30` detached when nothing answers on the port.
 always: start it the same way (without the idle exit) unless the login unit is installed, and note once that
-`brain serve --install always` starts it at login. manual: nothing. Never blocks the session and always exits 0.
+`brain serve --install always` starts it at login. manual: nothing. LEAN_PROFILE=off does nothing at all. Never blocks the session and always exits 0.
 
   serve-start.py [MODE]
   serve-start.py --self-test
@@ -17,7 +17,7 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "lib"))
-import hookkit  # noqa: E402
+from brain import hooks as bh  # noqa: E402
 
 HOOK = {
     "events": [
@@ -97,12 +97,14 @@ def start(mode, spawner=spawn, probe=answering, installed=None, stale=None, rein
     spawner((["--idle-exit", "30"] if mode == "session" else []) + (["--roots", roots] if roots else []))
     if mode == "always" and noted("install-noted"):
         said.append("The brain page was started for this session. "
-                    f"`{hookkit.tool_path('brain')} serve --install always` starts it at every login instead.")
+                    f"`{bh.tool_path('brain')} serve --install always` starts it at every login instead.")
     return "started", said
 
 
 def main():
-    hookkit.read_event()
+    if bh.off():
+        return 0
+    bh.read_event()
     mode = (sys.argv[1] if len(sys.argv) > 1 else "") or os.environ.get("CLAUDE_PLUGIN_OPTION_SERVE_MODE") or "manual"
     mode = mode.strip().lower()
     if mode.startswith("${"):  # a placeholder nothing substituted
@@ -113,7 +115,7 @@ def main():
     except Exception:
         return 0
     if said:
-        hookkit.note("SessionStart", "\n".join(said))
+        bh.context("SessionStart", "\n".join(said))
     return 0
 
 
@@ -166,6 +168,19 @@ def self_test():
                                capture_output=True, text=True, timeout=10)
             if r.returncode != 0 or (args != ["bogus"] and r.stdout):
                 fails.append(f"{args}: {r.returncode} {r.stdout!r}")
+        env.pop("LEAN_PROFILE", None)
+        marker = os.path.join(d, "serve-bad-mode")
+        if os.path.exists(marker):
+            os.unlink(marker)
+        r = subprocess.run([sys.executable, os.path.realpath(__file__)], input="{}", capture_output=True, text=True,
+                           timeout=10, env=dict(env, CLAUDE_PLUGIN_OPTION_SERVE_MODE="bogus"))
+        if r.returncode != 0 or "serve_mode is 'bogus'" not in r.stdout:
+            fails.append(f"the mode must come from CLAUDE_PLUGIN_OPTION_SERVE_MODE: {r.returncode} {r.stdout!r}")
+        os.unlink(marker)
+        r = subprocess.run([sys.executable, os.path.realpath(__file__)], input="{}", capture_output=True, text=True,
+                           timeout=10, env=dict(env, CLAUDE_PLUGIN_OPTION_SERVE_MODE="bogus", LEAN_PROFILE="off"))
+        if (r.returncode, r.stdout, r.stderr) != (0, "", "") or os.path.exists(marker):
+            fails.append(f"LEAN_PROFILE=off must print and write nothing: {r.returncode} {r.stdout!r} {r.stderr!r}")
     print("self-test: ok" if not fails else "self-test failed:\n  " + "\n  ".join(fails))
     return 1 if fails else 0
 
@@ -173,4 +188,4 @@ def self_test():
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-test"]:
         sys.exit(self_test())
-    hookkit.run(main)
+    bh.run(main)

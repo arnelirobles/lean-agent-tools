@@ -4,7 +4,7 @@
 SessionStart hook (matcher startup|compact). Runs `brain digest` for the project of the session's
 directory and adds the digest as context: blockers, running agents and pending steps survive a
 compaction that way. Silent and fast when brain has no database or nothing is open, and it never fails
-the session. LEAN_BRAIN_RESUME=off turns it off.
+the session. LEAN_BRAIN_RESUME=off or LEAN_PROFILE=off turns it off.
 
   brain-resume.py --self-test
 """
@@ -15,7 +15,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
-import hookkit  # noqa: E402
+from brain import hooks as bh  # noqa: E402
 
 HOOK = {
     "events": [
@@ -28,8 +28,7 @@ HOOK = {
     "default": {"strict": "note", "standard": "note"},
 }
 
-TOOLS = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools"))
-BRAIN = os.path.join(TOOLS, "brain")
+BRAIN = os.path.join(bh.TOOLS, "brain")
 
 
 def db_path():
@@ -49,10 +48,12 @@ def digest(cwd, recover=False):
 
 
 def main():
-    event = hookkit.read_event()
+    if bh.off("LEAN_BRAIN_RESUME"):
+        return 0
+    event = bh.read_event()
     text = digest(str(event.get("cwd") or ""), event.get("source") == "compact")  # only a compaction loses state
     if text:
-        hookkit.note("SessionStart", f"Brain digest for this project (full list: {hookkit.tool_path("brain")} list --project NAME --status open). "
+        bh.context("SessionStart", f"Brain digest for this project (full list: {bh.tool_path('brain')} list --project NAME --status open). "
                      "Do not work around a blocker.\n" + text)
     return 0
 
@@ -66,6 +67,7 @@ def self_test():
         subprocess.run(["git", "init", "-q", proj], check=True)
         env = dict(os.environ, LEAN_BRAIN_DB=os.path.join(d, "none", "brain.db"))
         env.pop("LEAN_BRAIN_RESUME", None)
+        env.pop("LEAN_PROFILE", None)
 
         def hook(event='{"cwd": "%s"}' % proj):
             r = subprocess.run([sys.executable, me], input=event, env=env, capture_output=True, text=True)
@@ -112,6 +114,11 @@ def self_test():
         con.close()
         if hook() != (0, "", ""):
             fails.append("nothing open must be silent")
+        for var in ("LEAN_PROFILE", "LEAN_BRAIN_RESUME"):
+            env[var] = "off"
+            if hook('{"cwd": "%s", "source": "compact"}' % proj) != (0, "", ""):
+                fails.append(f"{var}=off must print nothing")
+            del env[var]
         if hook("not json")[0] != 0:
             fails.append("a bad event must not fail")
         # A database locked by another writer: brain waits past the hook's timeout, the hook prints nothing.
@@ -132,4 +139,4 @@ def self_test():
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-test"]:
         sys.exit(self_test())
-    hookkit.run(main)
+    bh.run(main)

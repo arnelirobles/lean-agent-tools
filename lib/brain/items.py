@@ -164,6 +164,30 @@ def cmd_close(a):
     return 0
 
 
+def session_start(con, sid, cwd):
+    with con:
+        con.execute("INSERT INTO sessions (id, cwd, started_at) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE"
+                    " SET cwd=excluded.cwd, started_at=excluded.started_at, ended_at=''", (sid, cwd, now()))
+
+
+def session_end(con, sid):
+    with con:
+        con.execute("UPDATE sessions SET ended_at=? WHERE id=?", (now(), sid))
+
+
+def take_answers(con, sid):
+    """The lines for this session's answered questions that it has not had yet, now marked delivered."""
+    lines = []
+    with con:
+        rows = con.execute("SELECT * FROM items WHERE session_id=? AND kind='question' AND resolution='answered'"
+                           " AND answer_delivered_at='' ORDER BY id", (sid,)).fetchall()
+        for r in rows:
+            answer = r["body"].rsplit("\n\nclosed: ", 1)[1] if "\n\nclosed: " in r["body"] else ""
+            lines.append(f"#{r['id']} {r['title']}: {answer}")
+            con.execute("UPDATE items SET answer_delivered_at=? WHERE id=?", (now(), r["id"]))
+    return lines
+
+
 def cmd_session(a):
     if a.action == "infer":
         sid, cwd = infer_session(connect())
@@ -174,13 +198,12 @@ def cmd_session(a):
     if not session_ok(a.id):
         sys.exit("brain: a session id takes letters, digits and dashes only")
     con = connect()
-    with con:
-        if a.action == "start":
-            con.execute("INSERT INTO sessions (id, cwd, started_at) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE"
-                        " SET cwd=excluded.cwd, started_at=excluded.started_at, ended_at=''", (a.id, a.cwd, now()))
-        elif a.action == "end":
-            con.execute("UPDATE sessions SET ended_at=? WHERE id=?", (now(), a.id))
-        else:
+    if a.action == "start":
+        session_start(con, a.id, a.cwd)
+    elif a.action == "end":
+        session_end(con, a.id)
+    else:
+        with con:
             r = con.execute("SELECT * FROM sessions WHERE id=?", (a.id,)).fetchone()
             print("unknown" if not r else f"{'ended' if r['ended_at'] else 'open'} {r['cwd']}")
     return 0
@@ -188,14 +211,8 @@ def cmd_session(a):
 
 def cmd_answers(a):
     """Print the answers to this session's questions that it has not had yet, and mark them delivered."""
-    con = connect()
-    with con:
-        rows = con.execute("SELECT * FROM items WHERE session_id=? AND kind='question' AND resolution='answered'"
-                           " AND answer_delivered_at='' ORDER BY id", (a.session,)).fetchall()
-        for r in rows:
-            answer = r["body"].rsplit("\n\nclosed: ", 1)[1] if "\n\nclosed: " in r["body"] else ""
-            print(f"#{r['id']} {r['title']}: {answer}")
-            con.execute("UPDATE items SET answer_delivered_at=? WHERE id=?", (now(), r["id"]))
+    for text in take_answers(connect(), a.session):
+        print(text)
     return 0
 
 
