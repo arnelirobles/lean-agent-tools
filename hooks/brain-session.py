@@ -65,6 +65,8 @@ def main():
     sid = event.get("session_id")
     sid = sid if isinstance(sid, str) and items.session_ok(sid) else None
     cwd = str(event.get("cwd") or "")
+    if any(c in cwd for c in "\r\n\x00"):  # a line break would split the env line on the next write
+        cwd = ""
     session_off = (os.environ.get("LEAN_SESSION_ENV") or "").lower() == "off"
     if name == "SessionStart":
         session = bool(sid) and not session_off
@@ -184,8 +186,23 @@ def self_test():
         env["CLAUDE_ENV_FILE"] = upgraded
         hook("SessionStart")
         got = open(upgraded).read().splitlines()
-        if got != [f'export PATH="$PATH":{shlex.quote(other_tools)}', mine]:
+        if any(old in ln for ln in got) or got.count(f'export PATH="$PATH":{shlex.quote(other_tools)}') != 1 \
+                or got.count(mine) != 1 or got[-1] != mine:
             fails.append(f"an older brain version's PATH line goes, another plugin's stays: {got!r}")
+        env["CLAUDE_ENV_FILE"] = env_file
+
+        nl_file = os.path.join(d, "newline-env")
+        env["CLAUDE_ENV_FILE"] = nl_file
+        bad_cwd = "/a\n' ; touch /tmp/x ; '"
+        for _ in range(2):
+            hook("SessionStart", sid="nl-1", raw=json.dumps({"hook_event_name": "SessionStart", "session_id": "nl-1",
+                                                             "cwd": bad_cwd}))
+        nl_lines = open(nl_file).read().splitlines()
+        if [ln for ln in nl_lines if "LEAN_SESSION_CWD" in ln] or \
+                [ln for ln in nl_lines if ln != mine and not ln.startswith("export LEAN_SESSION_ID=")]:
+            fails.append(f"a cwd with a newline must write no cwd line and leave only expected lines: {nl_lines!r}")
+        if brain_out("session", "status", "nl-1") != "open ":
+            fails.append("a cwd with a newline must be stored as an empty cwd")
         env["CLAUDE_ENV_FILE"] = env_file
 
         # session record and answers

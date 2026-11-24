@@ -114,7 +114,7 @@ def write_env(env_file, sid=None, cwd="", session=True):
     session = bool(sid and session)
     if session:
         new.append(f"export LEAN_SESSION_ID={shlex.quote(sid)}")
-        if cwd:
+        if cwd and not any(c in cwd for c in "\r\n\x00"):  # a line break would split the line on the next write
             new.append(f"export LEAN_SESSION_CWD={shlex.quote(cwd)}")
     new.append(path_line())
     existed = os.path.exists(env_file)
@@ -402,6 +402,16 @@ def self_test():
         ok, lines = both_once(order_b)
         if not ok:
             fails.append(f"our lines, then brain's, then ours again as a resume: {lines!r}")
+        env["CLAUDE_ENV_FILE"] = env_file
+        nl_file = os.path.join(d, "newline-env")
+        env["CLAUDE_ENV_FILE"] = nl_file
+        bad_cwd = "/a\n' ; touch /tmp/x ; '"
+        for _ in range(2):
+            hook("SessionStart", raw=json_str({"hook_event_name": "SessionStart", "session_id": "nl-1", "cwd": bad_cwd}))
+        nl_lines = open(nl_file).read().splitlines()
+        if [ln for ln in nl_lines if "LEAN_SESSION_CWD" in ln] or \
+                [ln for ln in nl_lines if ln != want and not ln.startswith("export LEAN_SESSION_ID=")]:
+            fails.append(f"a cwd with a newline must write no cwd line and leave only expected lines: {nl_lines!r}")
         env["CLAUDE_ENV_FILE"] = env_file
 
         before = open(env_file).read()
