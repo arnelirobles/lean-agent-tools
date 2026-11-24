@@ -450,6 +450,69 @@ def self_test():
                 p.wait(timeout=10)
             except Exception:
                 p.kill()
+        # In-process, with a fake test-phase and git hidden: a failed second list or a missing git is a tool error.
+        try:
+            import importlib.machinery
+            import importlib.util
+            loader = importlib.machinery.SourceFileLoader("tests_mcp_under_test", me)
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            fake_tp = os.path.join(d, "fake-test-phase.py")
+            with open(fake_tp, "w") as f:
+                f.write("import os, sys, time\n"
+                        "if '--status=queued' in sys.argv:\n"
+                        "    if os.environ.get('FAKE_TP_QUEUED') == 'slow':\n"
+                        "        time.sleep(5)\n"
+                        "    sys.stderr.write('fake queued list broke\\n')\n"
+                        "    sys.exit(1)\n"
+                        "print('job #7 running')\n")
+            mod.TEST_PHASE = fake_tp
+            res = mod.call_tool("queue_list", {})
+            if not res["isError"] or "fake queued list broke" not in res["content"][0]["text"]:
+                fails.append(f"C4: a failing queued list must be isError with its output: {res}")
+            mod.CALL_TIMEOUT = 1
+            os.environ["FAKE_TP_QUEUED"] = "slow"
+            try:
+                res = mod.call_tool("queue_list", {})
+            except Exception as e:
+                res = {"isError": False, "content": [{"text": f"raised {e!r}"}]}
+            finally:
+                os.environ.pop("FAKE_TP_QUEUED", None)
+            if not res["isError"] or "timed out" not in res["content"][0]["text"]:
+                fails.append(f"C4: a timeout of the queued list must be isError naming it: {res}")
+            nogit = os.path.join(d, "nogit")
+            os.makedirs(nogit, exist_ok=True)
+            old_path, os.environ["PATH"] = os.environ.get("PATH", ""), nogit
+            try:
+                try:
+                    res = mod.call_tool("queue_add", {"repo_dir": repo, "test_project": "tests/A.csproj"})
+                except Exception as e:
+                    res = {"isError": False, "content": [{"text": f"raised {e!r}"}]}
+                if not res["isError"] or not res["content"][0]["text"].startswith("git rev-parse failed:"):
+                    fails.append(f"C5: no git must give isError starting 'git rev-parse failed:': {res}")
+            finally:
+                os.environ["PATH"] = old_path
+            real_run = subprocess.run
+
+            def hung_git(argv, *a, **kw):
+                if argv and argv[0] == "git":
+                    raise subprocess.TimeoutExpired(argv, kw.get("timeout") or 1)
+                return real_run(argv, *a, **kw)
+
+            subprocess.run = hung_git
+            try:
+                try:
+                    res = mod.call_tool("queue_add", {"repo_dir": repo, "test_project": "tests/A.csproj"})
+                except Exception as e:
+                    res = {"isError": False, "content": [{"text": f"raised {e!r}"}]}
+            finally:
+                subprocess.run = real_run
+            text = res["content"][0]["text"]
+            if not res["isError"] or not text.startswith("git rev-parse failed:") or "timed out" not in text:
+                fails.append(f"C5: a hung git must give isError naming the timeout: {res}")
+        except Exception as e:
+            fails.append(f"in-process checks: exception {e!r}")
         if os.path.exists(argv_log):
             logged = open(argv_log).read()
             if "--args" in logged:

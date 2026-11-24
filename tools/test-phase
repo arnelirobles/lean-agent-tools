@@ -3043,8 +3043,7 @@ def brainless_checks(fails):
             return [open(os.path.join(r, f), errors="replace").read() for r, _, fs in os.walk(runs)
                     for f in fs if f.endswith(".log")]
 
-        def not_filed(env, name):
-            marker = "brain not installed, not filed:"
+        def not_filed(env, name, marker="brain not installed, not filed:"):
             hit = [t for t in job_logs(env) if marker in t and "Fx.Tests.Breaks" in t.split(marker, 1)[1]]
             if not hit or "kind: test-fail" not in hit[0]:
                 fails.append(f"{name}: the job log must say the failure was not filed and name the test: {job_logs(env)!r}")
@@ -3126,7 +3125,16 @@ def brainless_checks(fails):
         if r.returncode != 1 or job_states(env) != ["failed"] or time.monotonic() - started > 25 \
                 or "timed out" not in r.stderr:
             fails.append(f"a slow brain must time out and not hang the drain ({r.returncode}): {job_states(env)} {r.stderr}")
-        not_filed(env, "slow brain")
+        not_filed(env, "slow brain", "brain add failed (timed out after 5s), not filed:")
+
+        # A brain that is there and fails is not "not installed": the job log says it failed and why.
+        env, _ = case("failbrain", {"FAKE_BRAIN_EXIT": "1"})
+        r = drain(env)
+        if r.returncode != 1 or job_states(env) != ["failed"]:
+            fails.append(f"a failing brain must not stop the drain ({r.returncode}): {job_states(env)} {r.stderr}")
+        not_filed(env, "failing brain", "brain add failed (exit 1), not filed:")
+        if "brain not installed" in "".join(job_logs(env)):
+            fails.append("a failing brain must not be logged as not installed")
 
         # The drain summary names brain only when brain is there; otherwise it names the log folder.
         def summary(text):

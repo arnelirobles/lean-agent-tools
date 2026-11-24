@@ -4,6 +4,7 @@ State is a JSON file at $FAKE_BRAIN_STATE ({"next_id": N, "items": [...]}). Each
 as one JSON line to $FAKE_BRAIN_LOG. Environment:
   FAKE_BRAIN_VERSION  text printed for --version (default "brain 1.0.0"); "exit2" mimics an old brain
   FAKE_BRAIN_SLEEP    seconds to sleep before any call except --version
+  FAKE_BRAIN_EXIT     exit code for any call except --version, with one line on stderr (a brain that fails)
   FAKE_BRAIN_VERSION_SLEEP  seconds to sleep before answering --version (a slow probe)
   FAKE_BRAIN_RAW      printed verbatim by `list --json` instead of the items
   FAKE_BRAIN_STDIN_LOG  file that gets each unmodelled call's stdin as one JSON string per line
@@ -76,6 +77,10 @@ def main(argv, stdin=None):
     delay = env.get("FAKE_BRAIN_SLEEP")
     if delay:
         time.sleep(float(delay))
+    code = env.get("FAKE_BRAIN_EXIT")
+    if code:
+        sys.stderr.write("brain: fake failure\n")
+        return int(code)
     path = env.get("FAKE_BRAIN_STATE")
     state = _load(path) if path else {"next_id": 1, "items": []}
     cmd = argv[0] if argv else ""

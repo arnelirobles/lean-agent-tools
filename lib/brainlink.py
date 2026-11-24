@@ -253,6 +253,25 @@ def self_test():
             # --version is never slowed, so a slow brain is still found
             got, err = run(lambda: find_brain({"PATH": os.path.dirname(slow)}, home0))
             check("slow brain still answers --version at once", got == slow and err == [])
+
+            # a caller that must tell a missing brain from a failed one asks call_status
+            status = globals().get("call_status")
+            check("call_status exists", status is not None)
+            if status is not None:
+                os.environ["PATH"] = empty
+                (out, fail), _ = run(lambda: status(["list", "--json"], timeout=2))
+                check("call_status: no brain is missing", out is None and fail == ("missing", ""))
+                failing = fakebrain.install_fake(os.path.join(d, "failing"), {"FAKE_BRAIN_EXIT": "1"})
+                os.environ["PATH"] = os.path.dirname(failing)
+                (out, fail), _ = run(lambda: status(["list", "--json"], timeout=2))
+                check("call_status: exit 1 is a failure with the code", out is None and fail == ("failed", "exit 1"))
+                os.environ["PATH"] = os.path.dirname(slow)
+                (out, fail), _ = run(lambda: status(["list", "--json"], timeout=1))
+                check("call_status: a timeout is a failure with the limit",
+                      out is None and fail == ("failed", "timed out after 1s"))
+                os.environ["PATH"] = pdir
+                (out, fail), _ = run(lambda: status(["list", "--json"], timeout=2))
+                check("call_status: success has no failure", out is not None and fail is None)
         finally:
             os.environ.clear()
             os.environ.update(saved)

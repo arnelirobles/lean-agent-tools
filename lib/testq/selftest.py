@@ -471,6 +471,163 @@ def upgrade_checks(fails, d):
             fails.append(f"a newer tests.db schema must exit 2 with one line naming the schema: {rc} {err!r}")
 
 
+def marker_count(path):
+    con = sqlite3.connect(path)
+    try:
+        return con.execute("SELECT COUNT(*) FROM meta WHERE key=?", (store.MARKER,)).fetchone()[0]
+    except sqlite3.OperationalError:
+        return 0
+    finally:
+        con.close()
+
+
+def attempt(*argv):
+    """run(), but an exception is a result, so one check cannot end its group."""
+    try:
+        return run(*argv)
+    except Exception as e:  # noqa: BLE001
+        return "raised", "", repr(e)
+
+
+def review_checks(fails, d):
+    """Findings of the adversarial review: an unreadable brain.db, the marker only after a read, what
+    queue import says, the read snapshot, and a brain that fails."""
+    # C1: a brain.db that is not a database ends no command and writes no marker
+    bad = os.path.join(d, "rv-bad.db")
+    with open(bad, "wb") as f:
+        f.write(b"not a database\n" * 20)
+    tests = os.path.join(d, "rv-bad-tests.db")
+    os.environ["LEAN_BRAIN_DB"] = bad
+    os.environ["LEAN_TESTS_DB"] = tests
+    want = f"test-phase: could not read {bad} ("
+    tail = "); the 1.x queue was not copied. Fix or move that file, then run test-phase queue import."
+    with isolated(d, "rv-bad"):
+        rc, out, err = attempt("queue", "list")
+        if rc != 0 or len(err.splitlines()) != 1 or not err.startswith(want) or not err.endswith(tail):
+            fails.append(f"C1: queue list with an unreadable brain.db must exit 0 with one line naming the file: {rc} {err!r}")
+        if os.path.exists(tests) and marker_count(tests):
+            fails.append("C1: an unreadable brain.db must leave no marker")
+        rc, out, err = attempt("queue", "import")
+        if rc != 1 or not err.startswith(want) or not err.endswith(tail):
+            fails.append(f"C1: queue import with an unreadable brain.db must exit 1 with the same line: {rc} {err!r}")
+        os.remove(bad)
+        make_brain(bad, 9, [(1, "done")], [1])
+        rc, out, err = attempt("queue", "list")
+        if rc != 0 or not os.path.exists(tests) or marker_count(tests) != 1:
+            fails.append(f"C1: once brain.db is readable the next run must copy it: {rc} {err!r}")
+
+    # C2: the marker is written only after brain.db was read
+    none = os.path.join(d, "rv-none.db")
+    tests = os.path.join(d, "rv-none-tests.db")
+    os.environ["LEAN_BRAIN_DB"] = none
+    os.environ["LEAN_TESTS_DB"] = tests
+    with isolated(d, "rv-none"):
+        rc, out, err = attempt("queue", "list")
+        if rc != 0 or marker_count(tests):
+            fails.append(f"C2: with no brain.db queue list must write no marker: {rc} {err!r}")
+        make_brain(none, 9, [(1, "done")], [1])
+        rc, out, err = attempt("queue", "list")
+        chk = sqlite3.connect(tests)
+        got = chk.execute("SELECT (SELECT COUNT(*) FROM jobs), (SELECT COUNT(*) FROM runs)").fetchone()
+        chk.close()
+        if rc != 0 or tuple(got) != (1, 1) or marker_count(tests) != 1:
+            fails.append(f"C2: a brain.db that appears later must be copied and marked: {rc} {tuple(got)} {err!r}")
+
+    # C2: with no brain.db, connect takes no write lock on tests.db
+    os.environ["LEAN_BRAIN_DB"] = os.path.join(d, "rv-nolock-none.db")
+    os.environ["LEAN_TESTS_DB"] = tests = os.path.join(d, "rv-nolock-tests.db")
+    with isolated(d, "rv-nolock"):
+        store.connect().close()
+        chk = sqlite3.connect(tests, isolation_level=None)
+        chk.execute("DELETE FROM meta WHERE key=?", (store.MARKER,))
+        chk.execute("BEGIN IMMEDIATE")
+        try:
+            store.connect(timeout=0.3).close()
+        except Exception as e:  # noqa: BLE001
+            fails.append(f"C2: connect with no brain.db must not take the write lock: {e!r}")
+        finally:
+            chk.execute("ROLLBACK")
+            chk.close()
+
+    # C3: queue import says what it did
+    none = os.path.join(d, "rv-imp-none.db")
+    os.environ["LEAN_BRAIN_DB"] = none
+    os.environ["LEAN_TESTS_DB"] = os.path.join(d, "rv-imp-none-tests.db")
+    with isolated(d, "rv-imp-none"):
+        rc, out, err = attempt("queue", "import")
+        if rc != 0 or out != f"no brain.db at {none}, nothing to copy" or "copied" in out:
+            fails.append(f"C3: queue import with no brain.db must say nothing to copy: {rc} {out!r} {err!r}")
+    some = os.path.join(d, "rv-imp-some.db")
+    make_brain(some, 9, [(1, "done"), (2, "failed")], [1])
+    os.environ["LEAN_BRAIN_DB"] = some
+    os.environ["LEAN_TESTS_DB"] = os.path.join(d, "rv-imp-some-tests.db")
+    with isolated(d, "rv-imp-some"):
+        rc, out, err = attempt("queue", "import")
+        if rc != 0 or out != f"copied 2 jobs and 1 runs from {some}":
+            fails.append(f"C3: queue import must say how many jobs and runs it copied: {rc} {out!r} {err!r}")
+
+    # C9: brain.db keeps its bytes, and the copy reads one snapshot. With the rollback journal a reader
+    # in a transaction blocks a writer, so a write from another connection between the runs read and the
+    # jobs read must fail with "database is locked".
+    snap = os.path.join(d, "rv-snap.db")
+    make_brain(snap, 9, [(1, "done"), (2, "done")], [1, 2])
+    os.environ["LEAN_BRAIN_DB"] = snap
+    os.environ["LEAN_TESTS_DB"] = os.path.join(d, "rv-snap-tests.db")
+    before = sha(snap)
+    real_connect = sqlite3.connect
+    probe = []
+
+    class Spy(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if "FROM jobs ORDER BY" in sql and not probe:
+                other = real_connect(snap, timeout=0)
+                try:
+                    other.execute("INSERT INTO meta VALUES ('probe', '1')")
+                    other.commit()
+                    probe.append("wrote")
+                except sqlite3.OperationalError as e:
+                    probe.append(str(e))
+                    other.rollback()
+                finally:
+                    other.close()
+            return super().execute(sql, *args)
+
+    def spy_connect(*args, **kw):
+        if kw.get("uri"):
+            kw["factory"] = Spy
+        return real_connect(*args, **kw)
+
+    with isolated(d, "rv-snap"):
+        sqlite3.connect = spy_connect
+        try:
+            con = store.connect()
+            jobs = count(con, "jobs")
+            con.close()
+        except Exception as e:  # noqa: BLE001
+            jobs = repr(e)
+        finally:
+            sqlite3.connect = real_connect
+    if jobs != 2:
+        fails.append(f"C9: the snapshot copy must bring both jobs: {jobs}")
+    if probe != ["database is locked"]:
+        fails.append(f"C9: a write between the runs and jobs reads must be refused while the copy reads: {probe}")
+    if sha(snap) != before:
+        fails.append("C9: the copy must leave the brain.db bytes as they were")
+
+    # C6: stats tells a brain that failed from a brain that is not installed
+    os.environ["LEAN_BRAIN_DB"] = os.path.join(d, "rv-stats-none.db")
+    os.environ["LEAN_TESTS_DB"] = os.path.join(d, "rv-stats-tests.db")
+    with isolated(d, "rv-stats", fake={"FAKE_BRAIN_EXIT": "1"}):
+        run("run-add", "--cycle", "c1", "--project", "core", "--test-project", "T.csproj", "--tier", "full",
+            "--runner", "mtp", "--started", "1000", "--ended", "1100", "--passed", "9", "--failed", "0", "--exit-code", "0")
+        try:
+            suite = (json.loads(run("stats", "--json")[1]).get("suites") or [{}])[0]
+        except ValueError:
+            suite = {}
+        if suite.get("flaky_items") != "brain failed" or suite.get("flaky_rate") != "brain failed":
+            fails.append(f"C6: stats with a failing brain must say brain failed: {suite}")
+
+
 DOTNET_SHIM = ('#!/bin/sh\necho "$*" >> "$FAKE_LOG"\n[ "$1" = build ] && exit 0\n'
                'f="$FAKE_DIR/out-$(basename "$2")"\ncat "$f"\nexit "$(cat "$f.rc")"\n')
 TEST_PHASE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -580,11 +737,11 @@ def self_test():
         if "branch" not in columns(path, "jobs"):
             fails.append("jobs must have a branch column")
 
-        # a brain.db that shows up after the first connect is not copied
+        # no brain.db at the first connect writes no marker, so a 1.x brain.db that shows up later is copied
         make_brain(brain, 9, [(1, "done")], [1])
         con = store.connect()
-        if count(con, "jobs") or count(con, "runs"):
-            fails.append("the copy must run once: a later brain.db must not be copied")
+        if count(con, "jobs") != 1 or count(con, "runs") != 1:
+            fails.append("a brain.db that shows up after a connect with none must be copied by the next connect")
         con.close()
 
         # version 9 with 3 done jobs and 2 runs
@@ -688,7 +845,7 @@ def self_test():
         con.close()
 
         for checks in (queue_checks, session_checks, flaky_checks, stats_checks, refused_checks, upgrade_checks,
-                       e2e_brain_checks):
+                       review_checks, e2e_brain_checks):
             try:
                 checks(fails, d)
             except Exception as e:  # noqa: BLE001  one crashed group must not hide the others
