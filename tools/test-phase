@@ -7,7 +7,7 @@ usage: test-phase [PLAN] [--cycle C] [--lane L] [--stall S] [--fail-stall S] [--
        test-phase --self-test
 
 The cycle this serves: code everything with builds only, queue the test runs, drain the queue once,
-read `brain list --open`, fix, run again. Nobody waits in a loop: `brain queue add` returns at once,
+read `brain list --open`, fix, run again. Nobody waits in a loop: `test-phase queue add` returns at once,
 and one drainer (start it as a background task) takes the oldest ready job, runs it, and repeats until
 nothing is ready. A second test-phase while one is draining says so and exits 0; the running drainer
 picks up whatever was enqueued. A job whose --after job failed or was cancelled is cancelled with the
@@ -24,7 +24,7 @@ name or a fragment of one (for MTP the fast tier passes *fragment* to --filter-c
 the exact class); with it the line becomes two jobs, the fast slice and then the whole project.
 
 Extra dotnet arguments, such as MSBuild properties, go on every command of a job: set TEST_PHASE_DOTNET_ARGS
-(split like a shell line) for all jobs, and "args=EXTRA" on a plan line or `brain queue add --args=EXTRA` for
+(split like a shell line) for all jobs, and "args=EXTRA" on a plan line or `test-phase queue add --args=EXTRA` for
 one job. They come after the project and before the logger, or before `--` in MTP mode. Example for the
 Mac Catalyst desktop tests, which need Xcode checks off:
 
@@ -55,7 +55,7 @@ failures, no passes, for --fail-stall seconds is stopped and recorded as stalled
 When more than --isolation-over tests (default 10) fail in one run and every one passes alone, one
 isolation item lists them and no flaky items are filed: that is a leak between tests. In a full run, a test
 that fails and passes alone again on a branch that already has an open flaky item for it becomes a
-test-fail tagged order-dependent. A passing full run runs `brain flaky-clear`, which closes flaky items
+test-fail tagged order-dependent. A passing full run runs `test-phase flaky-clear`, which closes flaky items
 with no new occurrence in 5 passing full runs, resolution flaky-cleared.
 Logs are under the run directory: ${LEAN_TEST_PHASE_DIR:-~/.local/share/lean/test-phase}/<timestamp>.
 
@@ -73,7 +73,7 @@ Logs are under the run directory: ${LEAN_TEST_PHASE_DIR:-~/.local/share/lean/tes
 
 Every command is also recorded as a row in brain's runs table (tier fast, full or rerun, duration, time
 spent waiting for the lane, load average at start and end, passed, failed, skipped, stalled, exit code),
-and each item points at the run that showed it. `brain stats` reads them.
+and each item points at the run that showed it. `test-phase stats` reads them.
 
 Prerequisites. A repository may list what its tests need in .lean/test-needs (Docker reachable, a path
 such as a sibling checkout (looked for from the main checkout), an environment variable set, a command on PATH, optionally GNU or a minimum
@@ -92,7 +92,7 @@ A failed run that names no test but whose log shows a npm login error (E401, ENE
 gets the same kind of blocker, with the hint to run it on the local lane.
 
 Remote lanes. When ~/.config/lean/remotes.ini names SSH hosts, the one drainer runs one lane per host next
-to the local lane, each claiming the next ready job with `brain queue next`. A remote lane copies the job's
+to the local lane, each claiming the next ready job with `test-phase queue next`. A remote lane copies the job's
 worktree to the host, runs the same test command in a capped container there, and streams the output back
 into the same log, so parsing and brain stay local. A job that targets an Apple platform, or an npm job whose .npmrc names a private registry, runs only on the
 local lane. If the host, the connection or the copy fails, the job goes back to queued and the lane rests
@@ -142,6 +142,7 @@ apple; a Gradle job never runs on a remote lane. With no ./gradlew the job fails
 """
 import argparse
 import fcntl
+import io
 import json
 import os
 import re
@@ -162,6 +163,7 @@ try:
     import heavy_lock as hl
 except ImportError:  # without the helper a job takes the lane command by command, as before
     hl = None
+import brainlink
 import gradle_args as ga
 from test_kinds import DOTNET_FILES, GO_PATTERN, SUPPORTED_KINDS
 try:
@@ -179,6 +181,8 @@ except ImportError:  # without it no jest package is recognised
 LaneProblem = lr.LaneProblem if lr else type("LaneProblem", (Exception,), {})
 HEAVY = os.path.join(HERE, "heavy.sh")
 BRAIN = os.path.join(HERE, "brain")
+TEST_PHASE = SELF
+BRAIN_TIMEOUT = 5  # every brain call has a limit, so a slow or locked brain cannot hang the drainer
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 # MTP prints "failed Name (1s 184ms)" at column 0. The VSTest console logger prints "  Failed Name [3 ms]"
 # with exactly two spaces; a deeper indent is an assertion dump ("    Failed = 1,") and is not a test.
@@ -1193,19 +1197,79 @@ def mask(text):
 
 
 def brain(args, stdin=None):
-    r = subprocess.run([sys.executable, BRAIN] + args, capture_output=True, text=True, input=stdin)
-    if r.returncode != 0:
-        sys.stderr.write("test-phase: brain failed: " + r.stderr.strip() + "\n")
+    """Run the brain command (items only) through brainlink. None when brain is missing or fails."""
+    out = brainlink.call(args, stdin=stdin, timeout=BRAIN_TIMEOUT)
+    return None if out is None else out.strip()
+
+
+def brain_items(args):
+    """Items from `brain list --json`; an empty list when brain is missing or fails."""
+    return brainlink.list_json(args, timeout=BRAIN_TIMEOUT) or []
+
+
+class _Tee:
+    """Stands in for sys.stdout or sys.stderr: text written by a thread inside testq_run goes to that thread's
+    buffer, so lane threads do not swallow each other's output."""
+
+    def __init__(self, real):
+        self._real = real
+        self._local = threading.local()
+
+    def write(self, text):
+        buf = getattr(self._local, "buf", None)
+        return (self._real if buf is None else buf).write(text)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+_tee_lock = threading.Lock()
+
+
+def testq_run(argv):
+    """Run `test-phase <argv>` (queue, run-add, flaky-clear, stats) in process: (exit code, stdout, stderr)."""
+    from testq import cli
+    with _tee_lock:
+        for name in ("stdout", "stderr"):
+            if not isinstance(getattr(sys, name), _Tee):
+                setattr(sys, name, _Tee(getattr(sys, name)))
+    out_t, err_t = sys.stdout, sys.stderr
+    out, err = io.StringIO(), io.StringIO()
+    out_t._local.buf, err_t._local.buf = out, err
+    try:
+        try:
+            rc = cli.main(list(argv))
+        except SystemExit as e:  # argparse and sys.exit("message") leave this way
+            if isinstance(e.code, int):
+                rc = e.code
+            else:
+                rc = 0 if e.code is None else 1
+                if e.code is not None:
+                    err.write(str(e.code) + "\n")
+    finally:
+        out_t._local.buf = err_t._local.buf = None
+    return rc or 0, out.getvalue(), err.getvalue()
+
+
+def testq_cli(argv):
+    """stdout of a testq command, stripped; None on a non-zero code, with its stderr passed on."""
+    rc, out, err = testq_run(argv)
+    if rc != 0:
+        sys.stderr.write("test-phase: " + (err.strip() or f"{' '.join(argv[:2])} exit {rc}") + "\n")
         return None
-    return r.stdout.strip()
+    return out.strip()
+
+
+def queue_cli(args):
+    return testq_cli(["queue", *args])
 
 
 def requeue_job(job_id, problem, say):
     """Put a running job back in the queue. One retry; a loud line when it still fails. True when requeued."""
     for _ in range(2):
-        if brain(["queue", "requeue", str(job_id), "--reason", problem[:200]]) is not None:
+        if queue_cli(["requeue", str(job_id), "--reason", problem[:200]]) is not None:
             return True
-    say(f"test-phase: job #{job_id} is STUCK running: brain would not requeue it ({problem[:120]})")
+    say(f"test-phase: job #{job_id} is STUCK running: the queue would not requeue it ({problem[:120]})")
     return False
 
 
@@ -1222,13 +1286,17 @@ def add_item(row, kind, ref, severity, body, run_id, ctx, tags=()):
         args += ["--run-id", str(run_id)]
     for t in tags:
         args += ["--tag", t]
-    brain(args, stdin=mask(body))  # the body goes by stdin, not argv, where any user's ps could read it
+    text = mask(body)
+    if brain(args, stdin=text) is None and ctx.get("log"):  # the body goes by stdin, not argv, where any user's ps could read it
+        with open(ctx["log"], "a") as fh:
+            fh.write("\nbrain not installed, not filed:\n" f"kind: {kind}\nref: {ref}\ntitle: {ref}\n"
+                     + "\n".join(text.splitlines()[:40]) + "\n")
 
 
 def record_run(row, ctx, tier, mode, rc, text, started, ended, wait, load_start, project, lane=LOCAL, stalled=False):
     passed, failed, skipped = ctx["runner"].counts(text)
     load_end = lr.remote_load(lane.remote) if lane.remote else load1()
-    out = brain(["run-add", "--cycle", ctx["cycle"], "--project", row["project"], "--repo", ctx["repo"],
+    out = testq_cli(["run-add", "--cycle", ctx["cycle"], "--project", row["project"], "--repo", ctx["repo"],
                  "--test-project", tp_name(project), "--runner", mode, "--tier", tier,
                  "--started", str(started), "--ended", str(ended), "--passed", str(passed),
                  "--failed", str(failed), "--skipped", str(skipped), "--stalled", "1" if rc in (76, 78) or stalled else "0",
@@ -1290,32 +1358,27 @@ def stall_facts(text):
 
 def close_blockers(row, ctx, project):
     """Close this project's open environment and test-needs blockers on this branch. A full run passed, so both are over."""
-    where = row["project"] + ("@" + ctx["branch"] if ctx["branch"] else "")
-    text = brain(["list", "--open", "--kind", "blocker", "--project", row["project"]]) or ""
     closed = 0
-    for m in re.finditer(r"^#(\d+) open \S+ (\S+) (.+?) (?:minor|important|info) occ=", text, re.M):
-        ref = m.group(3)
-        if m.group(2) == where and (ref == f"test-needs: {project}"
-                                    or (ref.startswith("environment: ") and ref.endswith(f": {project}"))):
-            if brain(["close", m.group(1), "--resolution", "fixed", "--note", "a full run of the test project passed"]) is not None:
+    for it in brain_items(["--open", "--kind", "blocker", "--project", row["project"]]):
+        ref = it.get("ref") or it.get("title") or ""
+        if (it.get("branch") or "") == ctx["branch"] and (ref == f"test-needs: {project}"
+                                                          or (ref.startswith("environment: ") and ref.endswith(f": {project}"))):
+            if brain(["close", str(it["id"]), "--resolution", "fixed", "--note", "a full run of the test project passed"]) is not None:
                 closed += 1
     return closed
 
 
 def earlier_items(row, ctx):
     """Item ids by test name: this branch's open flaky items, and its open order-dependent test-fails."""
-    where = row["project"] + ("@" + ctx["branch"] if ctx["branch"] else "")
     mine = "tp:" + tp_name(row["test"])  # a name can repeat in another test project: that is no history
     out = {"flaky": {}, "order": {}, "shared": set()}
     for kind, key, extra in (("flaky", "flaky", []), ("test-fail", "order", ["--tag", "order-dependent"])):
-        text = brain(["list", "--open", "--kind", kind, "--project", row["project"]] + extra) or ""
-        for m in re.finditer(r"^#(\d+) open \S+ (\S+) (.+?) (?:minor|important) occ=\d+ last=\S+(?: tags=(\S+))?$",
-                             text, re.M):
-            tags = (m.group(4) or "").split(",")
-            if m.group(2) == where and mine in tags:
-                out[key][m.group(3)] = int(m.group(1))
+        for it in brain_items(["--open", "--kind", kind, "--project", row["project"]] + extra):
+            tags = it.get("tags") or []
+            if (it.get("branch") or "") == ctx["branch"] and mine in tags:
+                out[key][it.get("ref") or it.get("title") or ""] = int(it["id"])
                 if any(t.startswith("tp:") and t != mine for t in tags):
-                    out["shared"].add(int(m.group(1)))  # another test project saw this name too
+                    out["shared"].add(int(it["id"]))  # another test project saw this name too
     return out
 
 
@@ -1352,12 +1415,10 @@ def no_name_reason(hang, text):
 def file_hang(row, hang, a, run_id, ctx, stem, seen):
     """One test-fail item per test the hang dump named as still running. A test already open as a hang on this
     branch hung on an earlier run too, so it is tagged hang-repeat: not load."""
-    where = row["project"] + ("@" + ctx["branch"] if ctx["branch"] else "")
     before = set()
-    text = brain(["list", "--open", "--kind", "test-fail", "--project", row["project"], "--tag", "hang"]) or ""
-    for m in re.finditer(r"^#(\d+) open \S+ (\S+) (.+?) (?:minor|important) occ=\d+ last=\S+(?: tags=(\S+))?$", text, re.M):
-        if m.group(2) == where:
-            before.add(m.group(3))
+    for it in brain_items(["--open", "--kind", "test-fail", "--project", row["project"], "--tag", "hang"]):
+        if (it.get("branch") or "") == ctx["branch"]:
+            before.add(it.get("ref") or it.get("title") or "")
     names = hang["names"]
     row["notes"].append(f"hung: {', '.join(names[:3])}" + (f" and {len(names) - 3} more" if len(names) > 3 else ""))
     for n in names:
@@ -1511,7 +1572,9 @@ def _run_job(job, a, run_dir, runner, lane, hold):
     if why:
         row = refused_row(job, why)
         ctx = {"repo": repo, "cycle": job["cycle"], "runner": runner,
-               "branch": a.branch if a.branch is not None else current_branch(repo)} if os.path.isdir(repo) else None
+               "branch": a.branch if a.branch is not None else current_branch(repo),
+               "log": os.path.join(run_dir, f"job{job['id']:03d}-{safe(tp_name(project))}-{job['tier']}.log")} \
+            if os.path.isdir(repo) else None
         if ctx:
             add_item(row, "test-fail", f"run-failed: {project}", "important", why, None, ctx)
         return row
@@ -1527,9 +1590,9 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         return row
     mode = runner.mode(repo)
     row["runner"] = f"{runner.name}/{mode}"
-    ctx = {"repo": repo, "cycle": job["cycle"], "runner": runner,
-           "branch": a.branch if a.branch is not None else current_branch(repo)}
     stem = os.path.join(run_dir, f"job{job['id']:03d}-{safe(tp_name(project))}-{job['tier']}")
+    ctx = {"repo": repo, "cycle": job["cycle"], "runner": runner,
+           "branch": a.branch if a.branch is not None else current_branch(repo), "log": stem + ".log"}
     failing = {}  # test name to its detail
 
     try:
@@ -1819,7 +1882,7 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         by_class.setdefault(runner.class_of(name), []).append(name)
     row["failing"] = len(failing)
     if rc == 0 and row["result"] == "pass" and job["tier"] == "full" and not job["filter"] and not failing:
-        cleared = (brain(["flaky-clear", "--project", row["project"], "--test-project", tp_name(project)])
+        cleared = (testq_cli(["flaky-clear", "--project", row["project"], "--test-project", tp_name(project)])
                    or "").splitlines()
         if cleared:
             row["notes"].append(f"{len(cleared)} flaky closed after 5 passing runs")
@@ -1885,23 +1948,23 @@ def enqueue(entries, a, cycle):
             # A refused add stops the plan: going on would run the fast slice and silently drop the full run.
             if tier_args[1] == "full" and again:
                 tier_args = tier_args + ["--again=" + again]
-            r = subprocess.run([sys.executable, BRAIN] + base + tier_args, capture_output=True, text=True)
-            if tier_args[1] == "fast" and r.returncode == 0 and "joined" not in r.stderr:
-                fast_id = r.stdout.strip()
+            rc, r_out, r_err = testq_run(base + tier_args)
+            if tier_args[1] == "fast" and rc == 0 and "joined" not in r_err:
+                fast_id = r_out.strip()
                 queued.append(fast_id)
-            elif r.returncode == 0 and r.stdout.strip().isdigit():
-                queued.append(r.stdout.strip())
-            if r.returncode != 0:
+            elif rc == 0 and r_out.strip().isdigit():
+                queued.append(r_out.strip())
+            if rc != 0:
                 if fast_id.isdigit():
-                    brain(["queue", "cancel", fast_id])
+                    queue_cli(["cancel", fast_id])
                     queued.remove(fast_id)
                 kept = f"jobs from earlier plan lines stay queued: {', '.join('#' + i for i in queued)}. " if queued else ""
-                sys.exit(f"test-phase: could not queue {project} ({tier_args[1]}): {r.stderr.strip()}\n"
+                sys.exit(f"test-phase: could not queue {project} ({tier_args[1]}): {r_err.strip()}\n"
                          f"test-phase: the rest of the plan was not queued; {kept}Fix that, or add again=REASON to the plan line to run it anyway.")
 
 
 def cancelled_ids():
-    return set(re.findall(r"^job #(\d+) cancelled", brain(["queue", "list", "--status", "cancelled"]) or "", re.M))
+    return set(re.findall(r"^job #(\d+) cancelled", queue_cli(["list", "--status", "cancelled"]) or "", re.M))
 
 
 def only_flaky(row):
@@ -1927,7 +1990,7 @@ def poll_seconds():
 
 
 def running_ids():
-    return [int(x) for x in re.findall(r"^job #(\d+) running", brain(["queue", "list", "--status", "running"]) or "", re.M)]
+    return [int(x) for x in re.findall(r"^job #(\d+) running", queue_cli(["list", "--status", "running"]) or "", re.M)]
 
 
 def sweep_remote(remote):
@@ -1950,13 +2013,13 @@ def drain(a, run_dir, lanes=None):
     before = cancelled_ids()
     remotes = {l.remote.name: l.remote for l in lanes if l.remote}
     # Jobs left running by a drainer that died cannot finish; fail them so their dependents are cancelled.
-    for line in (brain(["queue", "list", "--status", "running"]) or "").splitlines():
+    for line in (queue_cli(["list", "--status", "running"]) or "").splitlines():
         m = re.match(r"job #(\d+) ", line)
         if m:
             on = re.search(r" on=(\S+)$", line)
             if on and on.group(1) in remotes:
                 clean_remote(remotes[on.group(1)], m.group(1))
-            brain(["queue", "finish", m.group(1), "--status", "failed", "--reason", "drainer died"])
+            queue_cli(["finish", m.group(1), "--status", "failed", "--reason", "drainer died"])
     rows = []
     lock = threading.Lock()  # guards printing, rows and state
     wake = threading.Condition(lock)  # an idle lane waits on it, a finished job wakes it
@@ -2026,7 +2089,7 @@ def drain(a, run_dir, lanes=None):
                         continue
                     last_why, checked = None, time.monotonic()
                 count = done[0]
-                out = brain(["queue", "next", "--where", lane.where]
+                out = queue_cli(["next", "--where", lane.where]
                             + (["--host", lane.remote.name] if lane.remote else []))
                 if not out:
                     if idle(lane, count):
@@ -2062,7 +2125,7 @@ def drain(a, run_dir, lanes=None):
                 with lock:
                     rows.append(row)
                 reason = "; ".join(row["notes"])
-                brain(["queue", "finish", str(job["id"]), "--status",
+                queue_cli(["finish", str(job["id"]), "--status",
                        "done" if (row["rc"] == 0 and row["result"] == "pass") or only_flaky(row) else "failed"]
                       + (["--run-id", str(row["run_id"])] if row["run_id"] else [])
                       + (["--reason", reason] if reason else []))
@@ -2075,7 +2138,7 @@ def drain(a, run_dir, lanes=None):
         except Exception as e:  # noqa: BLE001  a crashed lane must not hang the others
             say(f"test-phase: lane {lane.name} crashed: {e!r}")
             if job:
-                brain(["queue", "finish", str(job["id"]), "--status", "failed", "--reason", f"lane crashed: {e!r}"[:200]])
+                queue_cli(["finish", str(job["id"]), "--status", "failed", "--reason", f"lane crashed: {e!r}"[:200]])
             with lock:
                 rows.append(error_row(job["id"] if job else 0, f"lane {lane.name} crashed: {e!r}"))
         finally:
@@ -2182,7 +2245,7 @@ def main(argv):
         cancelled += dropped
         fcntl.flock(lock, fcntl.LOCK_UN)
         # A job enqueued just as the drain ended would wait for the next drainer; look once more.
-        if not (brain(["queue", "next", "--peek"]) or "").strip():
+        if not (queue_cli(["next", "--peek"]) or "").strip():
             break
     if not rows:
         if runs:
@@ -2199,11 +2262,11 @@ def main(argv):
 
 def say_waiting_remote():
     """Name the queued jobs only a remote lane may claim, so one left behind is not a silent wait."""
-    ids = re.findall(r"^job #(\d+) queued .*platform=remote", brain(["queue", "list", "--status", "queued"]) or "",
+    ids = re.findall(r"^job #(\d+) queued .*platform=remote", queue_cli(["list", "--status", "queued"]) or "",
                      re.M)
     if ids:
         print(f"test-phase: {len(ids)} job{'s wait' if len(ids) > 1 else ' waits'} for a remote lane ("
-              + " ".join(f"#{i}" for i in ids) + "); `brain queue route ID --to any` lets this machine take one")
+              + " ".join(f"#{i}" for i in ids) + "); `test-phase queue route ID --to any` lets this machine take one")
 
 
 def vitest_checks(fails, fixture):
@@ -2266,13 +2329,13 @@ def vitest_checks(fails, fixture):
     if not tp or tp("web/package.json") == tp("mobile/package.json") or tp("tests/T/T.csproj") != "T.csproj":
         fails.append("two package.json test projects must not share one name")
     sent = []
-    real_brain = globals()["brain"]
-    globals()["brain"] = lambda args, stdin=None: sent.append(args) or ""
+    real_cli = globals()["testq_cli"]
+    globals()["testq_cli"] = lambda args: sent.append(args) or ""
     try:
         record_run({"project": "p"}, {"cycle": "c", "repo": "r", "runner": V}, "full", "vitest", 0, "", 1, 2, None,
                    None, "web/package.json")
     finally:
-        globals()["brain"] = real_brain
+        globals()["testq_cli"] = real_cli
     mine = sent[0][sent[0].index("--test-project") + 1] if sent and "--test-project" in sent[0] else ""
     if mine == "package.json" or "web" not in mine:
         fails.append(f"a run row names its package.json by folder: {mine!r}")
@@ -2583,7 +2646,7 @@ exit 0
     os.chmod(wrap, 0o755)
 
     def qadd(*args):
-        return subprocess.run([sys.executable, BRAIN, "queue", "add", *args], env=env, capture_output=True,
+        return subprocess.run([sys.executable, TEST_PHASE, "queue", "add", *args], env=env, capture_output=True,
                               text=True)
 
     def drain(*cmd):
@@ -2862,15 +2925,171 @@ FAKE_PW = "fake-pw-7f3"
 FAKE_ENV = "POSTGRES_" + "PASSWORD=" + FAKE_PW + "\n"
 
 
+def brain_bin(d):
+    """A folder on PATH holding only a `brain` that is this checkout's, so drained jobs file into the scratch database."""
+    folder = os.path.join(d, "brain-bin")
+    os.makedirs(folder, exist_ok=True)
+    link = os.path.join(folder, "brain")
+    if not os.path.lexists(link):
+        os.symlink(BRAIN, link)
+    return folder
+
+
+DOTNET_SHIM = ('#!/bin/sh\necho "$*" >> "$FAKE_LOG"\n[ "$1" = build ] && exit 0\n'
+               'f="$FAKE_DIR/out-$(basename "$2")"\ncat "$f"\nexit "$(cat "$f.rc")"\n')
+
+
+def tool_dir(d):
+    """A folder of symlinks to every command on PATH except brain, so a drain can run with no brain, or one fake."""
+    folder = os.path.join(d, "tools")
+    os.makedirs(folder, exist_ok=True)
+    for where in os.environ.get("PATH", "").split(os.pathsep):
+        try:
+            names = os.listdir(where) if where and not where.startswith(d) else []
+        except OSError:
+            continue
+        for name in names:
+            full, link = os.path.join(where, name), os.path.join(folder, name)
+            if name != "brain" and not os.path.lexists(link) and os.path.isfile(full) and os.access(full, os.X_OK):
+                os.symlink(full, link)
+    return folder
+
+
+def brainless_checks(fails):
+    """The drainer with no brain, a fake brain, an old brain and a slow brain. Each case gets its own PATH (the
+    fake dotnet, the brain if any, then every other command), an empty HOME, and its own databases."""
+    import sqlite3
+    from testq import fakebrain
+    with tempfile.TemporaryDirectory() as d:
+        shims = os.path.join(d, "shims")
+        os.mkdir(shims)
+        with open(os.path.join(shims, "dotnet"), "w") as fh:
+            fh.write(DOTNET_SHIM)
+        os.chmod(os.path.join(shims, "dotnet"), 0o755)
+        tools = tool_dir(d)
+        home = os.path.join(d, "home")
+        os.mkdir(home)
+        repo = os.path.join(d, "repo")
+        os.makedirs(os.path.join(repo, "tests", "T"))
+        plan = os.path.join(d, "plan.txt")
+        open(plan, "w").write(f"{repo} tests/T/Fx.csproj\n")
+
+        def output(text, rc):
+            open(os.path.join(d, "out-Fx.csproj"), "w").write(text)
+            open(os.path.join(d, "out-Fx.csproj.rc"), "w").write(str(rc))
+
+        def case(name, knobs=None):
+            """(env, brain path or None) for one case."""
+            base = os.path.join(d, name)
+            os.makedirs(base)
+            parts, brain_path = [shims], None
+            if knobs is not None:
+                brain_path = fakebrain.install_fake(os.path.join(base, "bin"), dict(
+                    knobs, FAKE_BRAIN_STATE=os.path.join(base, "state.json"), FAKE_BRAIN_LOG=os.path.join(base, "brain.log")))
+                parts.append(os.path.dirname(brain_path))
+            env = {k: v for k, v in os.environ.items() if not k.startswith("FAKE_BRAIN")}
+            env.update(PATH=os.pathsep.join(parts + [tools]), HOME=home, FAKE_DIR=d, FAKE_LOG=os.path.join(d, "calls.log"),
+                       LEAN_BRAIN_DB=os.path.join(base, "brain.db"), LEAN_TESTS_DB=os.path.join(base, "tests.db"),
+                       LEAN_DB=os.path.join(base, "lean.db"), HEAVY_LOCK_DIR=os.path.join(base, "locks"),
+                       LEAN_TEST_PHASE_DIR=os.path.join(base, "runs"), HEAVY_WAIT="20", TEST_PHASE_REMOTES="off")
+            env.pop("TEST_PHASE_RUNNER", None)
+            found = shutil.which("brain", path=env["PATH"])
+            if found != brain_path:
+                fails.append(f"{name}: the case PATH must find {brain_path or 'no brain'}, it finds {found}")
+            return env, brain_path
+
+        def drain(env):
+            open(env["FAKE_LOG"], "w").close()
+            return subprocess.run([sys.executable, SELF, plan], env=env, capture_output=True, text=True, timeout=240)
+
+        def job_states(env):
+            con = sqlite3.connect(env["LEAN_TESTS_DB"])
+            try:
+                return [r[0] for r in con.execute("SELECT status FROM jobs ORDER BY id")]
+            finally:
+                con.close()
+
+        def job_logs(env):
+            runs = env["LEAN_TEST_PHASE_DIR"]
+            return [open(os.path.join(r, f), errors="replace").read() for r, _, fs in os.walk(runs)
+                    for f in fs if f.endswith(".log")]
+
+        def not_filed(env, name):
+            marker = "brain not installed, not filed:"
+            hit = [t for t in job_logs(env) if marker in t and "Fx.Tests.Breaks" in t.split(marker, 1)[1]]
+            if not hit or "kind: test-fail" not in hit[0]:
+                fails.append(f"{name}: the job log must say the failure was not filed and name the test: {job_logs(env)!r}")
+
+        def brain_calls(base):
+            try:
+                lines = open(os.path.join(base, "brain.log")).read().splitlines()
+            except OSError:
+                return []
+            return [c for c in (json.loads(x) for x in lines) if c != ["--version"]]
+
+        failing = "  Failed Fx.Tests.Breaks [1 ms]\n   Assert.Equal() Failure\nFailed!  - Failed: 1, Passed: 0, Skipped: 0, Total: 1\n"
+        passing = "Passed!  - Failed:     0, Passed:     5, Skipped:     0, Total:     5\n"
+
+        # No brain anywhere: the job still runs and ends failed, the failure is written to the job log.
+        output(failing, 1)
+        env, _ = case("nobrain")
+        r = drain(env)
+        if r.returncode != 1 or "Traceback" in r.stdout + r.stderr or job_states(env) != ["failed"]:
+            fails.append(f"with no brain a failing job must drain and end failed ({r.returncode}): {job_states(env)} {r.stdout} {r.stderr}")
+        not_filed(env, "no brain")
+        if os.path.exists(env["LEAN_BRAIN_DB"]):
+            fails.append("a drain with no brain must not create a brain database")
+        if "skipping brain" in r.stderr:
+            fails.append(f"no brain at all is silent: {r.stderr!r}")
+
+        # A fake brain: the failure is an add, lookups are list --json, and no queue call reaches it.
+        env, _ = case("fake", {})
+        base = os.path.dirname(env["LEAN_TESTS_DB"])
+        r = drain(env)
+        calls = brain_calls(base)
+        adds = [c for c in calls if c[:1] == ["add"]]
+        if r.returncode != 1 or job_states(env) != ["failed"] or len(adds) != 1 or "test-fail" not in adds[0] \
+                or "Fx.Tests.Breaks" not in adds[0] or "not filed" in "".join(job_logs(env)):
+            fails.append(f"a failure must be filed as add --kind test-fail ({r.returncode}): {calls} {r.stdout} {r.stderr}")
+        output(passing, 0)
+        r = drain(env)
+        calls = brain_calls(base)
+        lists = [c for c in calls if c[:1] == ["list"]]
+        if r.returncode != 0 or not any(c[:2] == ["list", "--json"] and "blocker" in c for c in lists) \
+                or any("--json" not in c for c in lists) or any(c[:1] in (["queue"], ["run-add"], ["flaky-clear"]) for c in calls):
+            fails.append(f"a passing run looks up blockers with list --json and sends no queue call ({r.returncode}): {calls} {r.stderr}")
+        if not any(c[:2] == ["list", "--json"] and "flaky" in c for c in lists):
+            fails.append(f"a passing full run must look up flaky items through list --json: {calls}")
+
+        # An old brain on PATH and none in the cache: one skip line, then the same not-filed path.
+        output(failing, 1)
+        env, old = case("old", {"FAKE_BRAIN_VERSION": "exit2"})
+        r = drain(env)
+        want = f"lean-agent-tools: skipping brain at {old}: needs brain 1.0.0 or newer"
+        skips = [ln for ln in r.stderr.splitlines() if "skipping brain" in ln]
+        if r.returncode != 1 or job_states(env) != ["failed"] or skips != [want]:
+            fails.append(f"an old brain is skipped once on stderr ({r.returncode}): {skips} {job_states(env)} {r.stderr}")
+        not_filed(env, "old brain")
+
+        # A slow brain: the add times out, the job still ends and the failure is in the job log.
+        env, _ = case("slow", {"FAKE_BRAIN_SLEEP": "30"})
+        started = time.monotonic()
+        r = drain(env)
+        if r.returncode != 1 or job_states(env) != ["failed"] or time.monotonic() - started > 25 \
+                or "timed out" not in r.stderr:
+            fails.append(f"a slow brain must time out and not hang the drain ({r.returncode}): {job_states(env)} {r.stderr}")
+        not_filed(env, "slow brain")
+
+
 def needs_checks(fails):
     """Test prerequisites and environmental runs, on their own brain database and their own fake dotnet."""
     with tempfile.TemporaryDirectory() as d:
         shims = os.path.join(d, "shims")
         os.mkdir(shims)
         with open(os.path.join(shims, "dotnet"), "w") as fh:  # a build passes; a test prints the file named for the project, with its exit code
-            fh.write('#!/bin/sh\necho "$*" >> "$FAKE_LOG"\n[ "$1" = build ] && exit 0\nf="$FAKE_DIR/out-$(basename "$2")"\ncat "$f"\nexit "$(cat "$f.rc")"\n')
+            fh.write(DOTNET_SHIM)
         os.chmod(os.path.join(shims, "dotnet"), 0o755)
-        env = dict(os.environ, PATH=shims + os.pathsep + os.environ["PATH"], FAKE_DIR=d, HOME=d,
+        env = dict(os.environ, PATH=shims + os.pathsep + brain_bin(d) + os.pathsep + os.environ["PATH"], FAKE_DIR=d, HOME=d,
                    FAKE_LOG=os.path.join(d, "calls.log"), LEAN_BRAIN_DB=os.path.join(d, "brain.db"), LEAN_TESTS_DB=os.path.join(d, "tests.db"),
                    LEAN_DB=os.path.join(d, "lean.db"), HEAVY_LOCK_DIR=os.path.join(d, "locks"),
                    LEAN_TEST_PHASE_DIR=os.path.join(d, "runs"), HEAVY_WAIT="20", TEST_PHASE_REMOTES="off")
@@ -2959,7 +3178,7 @@ def needs_checks(fails):
             fails.append(f"missing prerequisites must be one blocker, no run, no value shown ({rc}): {nb} {calls} {body!r}")
         if items("needrefuse", "test-fail"):
             fails.append("a refusal must not be a test-fail")
-        ql = subprocess.run([sys.executable, BRAIN, "queue", "list"], env=env, capture_output=True, text=True).stdout
+        ql = subprocess.run([sys.executable, TEST_PHASE, "queue", "list"], env=env, capture_output=True, text=True).stdout
         if not re.search(r"failed.*test prerequisite\(s\) missing", ql):
             fails.append(f"a refused job must finish failed with the reason: {ql}")
         dr = subprocess.run([sys.executable, me, "--doctor", r_n], env=env, capture_output=True, text=True)
@@ -3381,19 +3600,20 @@ def self_test():
 
     # A requeue that fails once is retried; one that keeps failing is said loudly.
     calls, said = [], []
-    globals()["brain"] = lambda args, stdin=None: calls.append(args) or (None if len(calls) == 1 else "")
+    real_queue = globals()["queue_cli"]
+    globals()["queue_cli"] = lambda args: calls.append(args) or (None if len(calls) == 1 else "")
     try:
         ok = requeue_job(7, "ssh failed", said.append)
     finally:
-        globals()["brain"] = real_brain
+        globals()["queue_cli"] = real_queue
     if not ok or len(calls) != 2 or said:
         fails.append(f"a failed requeue must be retried once: {ok} {calls} {said}")
     calls.clear()
-    globals()["brain"] = lambda args, stdin=None: calls.append(args) or None
+    globals()["queue_cli"] = lambda args: calls.append(args) or None
     try:
         ok = requeue_job(7, "ssh failed", said.append)
     finally:
-        globals()["brain"] = real_brain
+        globals()["queue_cli"] = real_queue
     if ok or len(calls) != 2 or not said or "job #7" not in said[0] or "STUCK running" not in said[0]:
         fails.append(f"a requeue that keeps failing must name the stuck job: {ok} {calls} {said}")
 
@@ -3459,7 +3679,7 @@ if [ -f "$FAKE_DIR/full" ]; then cat "$FAKE_DIR/full"; exit "$(cat "$FAKE_DIR/fu
 echo "Test Run Successful."; echo "Total tests: 1"; echo "     Passed: 1"; exit 0
 ''')
         os.chmod(shim, 0o755)
-        env = dict(os.environ, PATH=bin_dir + os.pathsep + os.environ["PATH"], FAKE_DIR=d, FAKE_BRAIN=BRAIN,
+        env = dict(os.environ, PATH=bin_dir + os.pathsep + brain_bin(d) + os.pathsep + os.environ["PATH"], FAKE_DIR=d, FAKE_BRAIN=TEST_PHASE,
                    FAKE_LOG=os.path.join(d, "calls.log"), LEAN_BRAIN_DB=os.path.join(d, "brain.db"), LEAN_TESTS_DB=os.path.join(d, "tests.db"),
                    HEAVY_LOCK_DIR=os.path.join(d, "locks"), LEAN_TEST_PHASE_DIR=os.path.join(d, "runs"),
                    HEAVY_WAIT="20", TEST_PHASE_REMOTES="off")
@@ -3524,18 +3744,20 @@ echo "Test Run Successful."; echo "Total tests: 1"; echo "     Passed: 1"; exit 
             fails.append(f"logs not written to the run dir: {logs}")
 
         import sqlite3
-        con = sqlite3.connect(env["LEAN_BRAIN_DB"])
+        con = sqlite3.connect(env["LEAN_TESTS_DB"])
         runs = con.execute("SELECT tier, passed, failed, exit_code, lane_wait_s, load_end IS NOT NULL, cycle FROM runs"
                            " ORDER BY id").fetchall()
         if [r[0] for r in runs] != ["fast", "full", "rerun", "rerun"] or runs[1][1:4] != (1, 2, 1) \
                 or runs[1][4] is None or not runs[1][5] or not runs[1][6]:
             fails.append(f"runs table rows wrong: {runs}")
+        con.close()
+        con = sqlite3.connect(env["LEAN_BRAIN_DB"])
         linked = con.execute("SELECT COUNT(*) FROM items WHERE run_id IS NOT NULL AND source='test-phase'"
                              " AND phase='test' AND cycle != ''").fetchone()[0]
         if linked != 2:
             fails.append(f"items must link to their run and carry source, phase and cycle: {linked}")
         con.close()
-        st = json.loads(subprocess.run([sys.executable, BRAIN, "stats", "--json"], env=env, capture_output=True,
+        st = json.loads(subprocess.run([sys.executable, TEST_PHASE, "stats", "--json"], env=env, capture_output=True,
                                        text=True).stdout)
         if st["suites"][0]["runs"] != 2 or st["suites"][0]["flaky_items"] != 1:
             fails.append(f"stats over test-phase runs: {st['suites']}")
@@ -3688,7 +3910,7 @@ echo "Test Run Successful."; echo "Total tests: 1"; echo "     Passed: 1"; exit 
         # The queue. Job A fails to build, B waits on A, C is independent, D waits on B (a chain).
         # Drain order is by id among ready jobs; B and D are cancelled with the reason.
         def qadd(*args):
-            return subprocess.run([sys.executable, BRAIN, "queue", "add", *args], env=env, capture_output=True,
+            return subprocess.run([sys.executable, TEST_PHASE, "queue", "add", *args], env=env, capture_output=True,
                                   text=True).stdout.strip()
 
         def drain(*extra):
@@ -3698,7 +3920,7 @@ echo "Test Run Successful."; echo "Total tests: 1"; echo "     Passed: 1"; exit 
             return r.returncode, r.stdout + r.stderr, open(env["FAKE_LOG"]).read().splitlines()
 
         def qlist(*args):
-            return subprocess.run([sys.executable, BRAIN, "queue", "list", *args], env=env, capture_output=True,
+            return subprocess.run([sys.executable, TEST_PHASE, "queue", "list", *args], env=env, capture_output=True,
                                   text=True).stdout
 
         ja = qadd(repo_v, "tests/T/A.csproj", "--cycle", "qa")
@@ -3750,12 +3972,12 @@ echo "Test Run Successful."; echo "Total tests: 1"; echo "     Passed: 1"; exit 
 
         # A job routed to a remote lane, with no remote lane: the Mac leaves it queued and says so.
         jr = qadd(repo_v, "tests/T/R.csproj", "--platform", "none", "--cycle", "qr")
-        subprocess.run([sys.executable, BRAIN, "queue", "route", jr, "--to", "remote"], env=env, capture_output=True)
+        subprocess.run([sys.executable, TEST_PHASE, "queue", "route", jr, "--to", "remote"], env=env, capture_output=True)
         rc, out, calls = drain()
         if rc != 0 or calls or "1 job waits for a remote lane" not in out \
                 or f"job #{jr} queued" not in qlist("--cycle", "qr"):
             fails.append(f"a job routed to a remote lane must wait, named in the output ({rc}): {out} {calls}")
-        subprocess.run([sys.executable, BRAIN, "queue", "cancel", jr], env=env, capture_output=True)
+        subprocess.run([sys.executable, TEST_PHASE, "queue", "cancel", jr], env=env, capture_output=True)
 
         # Only one drainer: while one holds the lock, a second exits 0 and leaves the job queued.
         import fcntl
@@ -3775,10 +3997,10 @@ echo "Test Run Successful."; echo "Total tests: 1"; echo "     Passed: 1"; exit 
         # A job left running by a dead drainer is failed, and its dependent cancelled.
         jr = qadd(repo_v, "tests/T/R.csproj", "--platform", "none", "--cycle", "qr")
         jr2 = qadd(repo_v, "tests/T/R2.csproj", "--after", jr, "--cycle", "qr")
-        subprocess.run([sys.executable, BRAIN, "queue", "next"], env=env, capture_output=True, text=True)
+        subprocess.run([sys.executable, TEST_PHASE, "queue", "next"], env=env, capture_output=True, text=True)
         # that claimed an older ready job, if any; claim until jr is running
         while f"job #{jr} running" not in qlist("--cycle", "qr"):
-            if not subprocess.run([sys.executable, BRAIN, "queue", "next"], env=env, capture_output=True,
+            if not subprocess.run([sys.executable, TEST_PHASE, "queue", "next"], env=env, capture_output=True,
                                   text=True).stdout.strip():
                 break
         rc, out, calls = drain()
@@ -3826,7 +4048,7 @@ echo "Test Run Successful."; echo "Total tests: 1"; echo "     Passed: 1"; exit 
         open(os.path.join(d, "kill-once"), "w").close()
         jk = qadd(repo_v, "tests/T/K.csproj", "--cycle", "qk")
         rc, out, calls = drain()
-        con = sqlite3.connect(env["LEAN_BRAIN_DB"])
+        con = sqlite3.connect(env["LEAN_TESTS_DB"])
         killed_rows = con.execute("SELECT COUNT(*) FROM runs WHERE test_project='K.csproj' AND exit_code=143").fetchone()[0]
         con.close()
         if len([c for c in calls if "K.csproj" in c]) != 2 or f"job #{jk} done" not in qlist("--cycle", "qk") or rc != 0 \
@@ -4001,7 +4223,7 @@ esac
         left = [os.path.join(r, f) for r, _, fs in os.walk(os.path.join(d, "runs")) for f in fs if f.endswith((".dmp", ".xml"))]
         if left:
             fails.append(f"the hang dump must be deleted once the names are read: {left}")
-        con = sqlite3.connect(env["LEAN_BRAIN_DB"])
+        con = sqlite3.connect(env["LEAN_TESTS_DB"])
         hrun = con.execute("SELECT stalled FROM runs WHERE test_project='Hangs.csproj' AND exit_code=2").fetchall()
         con.close()
         if hrun != [(1,)]:
@@ -4072,7 +4294,7 @@ esac
         sf = [l for l in brain_list("--kind", "note").splitlines() if "stalled-failing: tests/T/Sf.csproj" in l]
         shown = subprocess.run([sys.executable, BRAIN, "show", sf[0].split()[0].lstrip("#")], env=env,
                                capture_output=True, text=True).stdout if sf else ""
-        con = sqlite3.connect(env["LEAN_BRAIN_DB"])
+        con = sqlite3.connect(env["LEAN_TESTS_DB"])
         sfrun = con.execute("SELECT stalled FROM runs WHERE test_project='Sf.csproj' AND exit_code=78").fetchall()
         con.close()
         if rc != 1 or "stalled-failing" not in out or "passed 0, failed " not in shown or "last test: failed Sf" not in shown \
@@ -4145,7 +4367,7 @@ exit 0
         if calls or rc == 0 or "yarn.lock" not in runlogs or "run-failed" not in brain_list("--kind", "test-fail"):
             fails.append(f"a yarn project must be refused before pnpm runs, with a run-failed item ({rc}): {calls} {out}")
         put("vitest-full", fixture("vitest-dash.log"))
-        subprocess.run([sys.executable, BRAIN, "queue", "add", "--", drepo, "-x/package.json"], env=env, capture_output=True)
+        subprocess.run([sys.executable, TEST_PHASE, "queue", "add", "--", drepo, "-x/package.json"], env=env, capture_output=True)
         rc, out, calls = drain()
         if calls != ["pnpm install --frozen-lockfile in -x", "pnpm exec vitest run --reporter=verbose in -x"] \
                 or "-a.test.ts" not in out:
@@ -4204,7 +4426,7 @@ exit 0
         # A path that is no dotnet project, no package.json and no playwright config is refused by name, never
         # handed to dotnet.
         for bad in ("notes.txt", "empty"):
-            r = subprocess.run([sys.executable, BRAIN, "queue", "add", repo_z, bad, "--cycle", "qu"], env=env,
+            r = subprocess.run([sys.executable, TEST_PHASE, "queue", "add", repo_z, bad, "--cycle", "qu"], env=env,
                                capture_output=True, text=True)
             if r.returncode == 0 or bad not in r.stderr or ".csproj" not in r.stderr:
                 fails.append(f"queue add of {bad!r} must be refused naming the path and the kinds: {r.returncode} {r.stderr!r}")
@@ -4247,7 +4469,7 @@ exit 0
         open(ini, "w").write(f"[remote dev]\nhost = devbox\nworkdir = {hostwork}\ncpus = 2\nmemory = 8g\n"
                              f"min_free_gb = 0\nextra_paths = local-packages\nreuse_build = no\n\n[repo rrepo]\n"
                              f"sidecars = db=postgres:16\nenv_file = {d}/rrepo.env\nready = pg_isready\n")
-        renv = dict(env, PATH=rfix + os.pathsep + os.environ["PATH"], TEST_PHASE_REMOTES_FILE=ini,
+        renv = dict(env, PATH=rfix + os.pathsep + env["PATH"], TEST_PHASE_REMOTES_FILE=ini,
                     FAKE_SSH_LOG=os.path.join(d, "ssh.log"), FAKE_DOCKER_DIR=dockdir, TEST_PHASE_REST="600",
                     HEAVY_WAIT="60")
         renv.pop("TEST_PHASE_REMOTES")
@@ -4271,7 +4493,7 @@ exit 0
                 return ""
 
         def runs_of(test_project):
-            c = sqlite3.connect(env["LEAN_BRAIN_DB"])
+            c = sqlite3.connect(env["LEAN_TESTS_DB"])
             got = c.execute("SELECT tier, host FROM runs WHERE test_project=? ORDER BY id", (test_project,)).fetchall()
             c.close()
             return got
@@ -4320,7 +4542,7 @@ exit 0
             os.makedirs(os.path.dirname(os.path.join(rrepo, f)), exist_ok=True)
             open(os.path.join(rrepo, f), "w").write("{}\n")
         vj = qadd(rrepo, "web/package.json", "--cycle", "r2v")
-        subprocess.run([sys.executable, BRAIN, "queue", "route", vj, "--to", "remote"], env=env, capture_output=True)
+        subprocess.run([sys.executable, TEST_PHASE, "queue", "route", vj, "--to", "remote"], env=env, capture_output=True)
         rc, out, _ = rdrain(e=dict(renv, LEAN_PNPM_VERSION="9"))
         shutil.rmtree(os.path.join(rrepo, "web"))
         if "./web/package.json" not in rlog("nfiles.log") or "node_modules" in rlog("nfiles.log") \
@@ -4332,7 +4554,7 @@ exit 0
         # An idle lane keeps polling while another lane works: the local lane finds nothing, then an apple job
         # arrives while the remote lane is still on its job, and the drain still ends.
         slow = qadd(rrepo, "tests/Apple/Apple.csproj", "--platform", "none", "--cycle", "r2b")
-        subprocess.run([sys.executable, BRAIN, "queue", "route", slow, "--to", "remote"], env=env, capture_output=True)
+        subprocess.run([sys.executable, TEST_PHASE, "queue", "route", slow, "--to", "remote"], env=env, capture_output=True)
         reset()
         proc = subprocess.Popen([sys.executable, os.path.realpath(__file__)], env=dict(renv, TEST_PHASE_POLL="0.3"),
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -4343,7 +4565,7 @@ exit 0
         except subprocess.TimeoutExpired:
             proc.kill()
             out = proc.communicate()[0] + " (killed, the drain did not end)"
-        c = sqlite3.connect(env["LEAN_BRAIN_DB"])
+        c = sqlite3.connect(env["LEAN_TESTS_DB"])
         started = c.execute("SELECT started_at FROM jobs WHERE id=?", (int(late),)).fetchone()[0] or ""
         ended = c.execute("SELECT ended_at FROM jobs WHERE id=?", (int(slow),)).fetchone()[0] or ""
         c.close()
@@ -4420,7 +4642,7 @@ exit 0
         def reuse_drain(cycle, *classes, e=None):
             for c in classes:
                 job = qadd(urepo, "tests/T/Reuse.csproj", "--tier", "fast", "--filter", c, "--cycle", cycle)
-                subprocess.run([sys.executable, BRAIN, "queue", "route", job, "--to", "remote"], env=env,
+                subprocess.run([sys.executable, TEST_PHASE, "queue", "route", job, "--to", "remote"], env=env,
                                capture_output=True)
             rc, out, _ = rdrain(e=dict(uenv, **(e or {})))
             where = rlog("where.log").splitlines()
@@ -4482,7 +4704,7 @@ exit 0
 
         # A job left running on a host by a dead drainer: the host's folder and containers go first.
         stale = qadd(rrepo, "tests/T/Stale.csproj", "--cycle", "r7")
-        got = subprocess.run([sys.executable, BRAIN, "queue", "next", "--host", "dev"], env=env, capture_output=True,
+        got = subprocess.run([sys.executable, TEST_PHASE, "queue", "next", "--host", "dev"], env=env, capture_output=True,
                              text=True).stdout
         os.makedirs(os.path.join(hostwork, f"job-{stale}"), exist_ok=True)
         os.makedirs(dockdir, exist_ok=True)
@@ -4492,6 +4714,7 @@ exit 0
                 or leftovers() != ([], []):
             fails.append(f"a stale remote job needs its host cleaned: {got!r} {qlist('--cycle', 'r7')} {leftovers()}")
     needs_checks(fails)
+    brainless_checks(fails)
     go_checks(fails)
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
