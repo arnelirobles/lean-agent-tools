@@ -24,6 +24,9 @@
             A folder that is not a git repo, or has no commit yet, gets neither check. An add identical to a queued job prints
             that job's id instead of adding one.
   test-phase queue list [--cycle C] [--status S]     --status queued lists in the order the drainer takes them
+  test-phase queue import [--cancel-live]      run the one-time copy from brain.db now. With queued or running jobs
+            in brain.db it is refused; --cancel-live copies them as cancelled (reason "queued under 1.x, not
+            run") and never writes brain.db
   test-phase queue bump ID                      a queued job, and the jobs chained after it, to the front
   test-phase queue move ID up|down              swap a queued job with the one before or after it; a job never
             moves ahead of the job it waits on
@@ -57,7 +60,7 @@ from .flaky import cmd_flaky_clear
 from .queue import JOB_STATUS, JOB_TIERS, cmd_queue
 from .runs import RUNNERS, TIERS, cmd_run_add
 from .stats import cmd_stats
-from .store import CopyRefused
+from .store import CopyRefused, NewerSchema
 
 
 def lower(s):
@@ -126,6 +129,9 @@ def parser():
     q = qs.add_parser("list")
     q.add_argument("--cycle")
     q.add_argument("--status", choices=JOB_STATUS)
+    q = qs.add_parser("import")
+    q.add_argument("--cancel-live", action="store_true",
+                   help="copy queued and running jobs of brain.db as cancelled instead of refusing")
     q = qs.add_parser("wait")
     q.add_argument("ids", type=int, nargs="+", metavar="ID")
     q.add_argument("--timeout", type=seconds, default=7200, help="seconds before giving up (exit 3), at least 1")
@@ -166,5 +172,9 @@ def main(argv):
         return args.fn(args)
     except CopyRefused as e:
         print(f"test-phase: brain.db still has {e.count} queued or running jobs. "
-              "Drain them with lean-agent-tools 1.x, then run this again.", file=sys.stderr)
+              "Drain them with lean-agent-tools 1.x, or run `test-phase queue import --cancel-live` "
+              "to copy them as cancelled.", file=sys.stderr)
+        return 2
+    except NewerSchema as e:
+        print(f"test-phase: {e}. Update lean-agent-tools.", file=sys.stderr)
         return 2

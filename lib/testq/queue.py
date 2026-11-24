@@ -12,7 +12,7 @@ import brainlink  # noqa: E402
 import gradle_args  # noqa: E402
 from test_kinds import DOTNET_FILES, GO_PATTERN, SUPPORTED_KINDS  # noqa: E402
 
-from .store import connect, now
+from .store import connect, copy_done, now
 
 BRAIN_TIMEOUT = 5
 
@@ -295,6 +295,13 @@ def queue_wait(con, a):
 
 
 def cmd_queue(a):
+    if a.qcmd == "import":
+        if copy_done():
+            print("the queue was already copied from brain.db, nothing to do")
+            return 0
+        connect(cancel_live=a.cancel_live).close()
+        print("copied the jobs and runs from brain.db into tests.db")
+        return 0
     con = connect()
     if a.qcmd == "wait":
         return queue_wait(con, a)

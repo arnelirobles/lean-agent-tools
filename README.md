@@ -88,7 +88,7 @@ brain list --cycle c1          # what the phase found (needs the brain plugin)
 brain list --open              # what the fix round works from
 brain close 12 --resolution fixed --commit abc1234
 test-phase                     # again, to see the list empty
-brain stats                    # flaky rate, lane wait and duration per test project (needs the brain plugin)
+test-phase stats               # runs, lane wait, duration and flaky rate per test project
 ```
 
 The scripts live in the plugin's `tools/` directory. At session start the plugin appends that folder to `PATH` in `$CLAUDE_ENV_FILE`, once per session (a resume after an upgrade adds the new version's folder), so a bare `test-phase` works in the session's shell and the hooks' notes use bare names. PowerShell reads the file only when every line is a plain assignment, so a PowerShell command loses the `LEAN_SESSION_*` variables because of the PATH line. Where `CLAUDE_ENV_FILE` is not set, the notes keep the absolute path, and in a skill or hook you can call `${CLAUDE_PLUGIN_ROOT}/tools/test-phase queue list`. In your own shell, put the folder on `PATH` in your profile, for example `export PATH="$(ls -d ~/.claude/plugins/*/lean-agent/lean-agent/*/tools | sort -V | tail -1):$PATH"` (it picks the newest installed version each time a shell starts), or symlink the tools you use into a folder already on `PATH`.
@@ -157,6 +157,14 @@ Brain never holds secrets, tokens or passwords.
 
 Reads of merged pull requests (`lean-stats collect` and `retro-signals.sh`) go through `lib/forge.py`, which supports GitHub (`gh`), GitLab (`glab`) and Azure DevOps (`az` with the azure-devops extension). `lean-stats collect` also counts merged Azure DevOps pull requests through `az` (they are stored as `ORG/PROJECT/REPO`), for the Azure repositories your transcripts already name. Naming repositories on the command line collects only those, and a line says when Azure ones were skipped. Fix rounds, failed checks and escaped refs stay empty for Azure rows. `forge.py` can also count the commits on an Azure pull request, but nothing calls it yet. Once a day `collect` rewrites old `_git/NAME` and `org/project` repo names to `ORG/PROJECT/REPO` from what `az repos list` shows for your default organization, so cost joins the changes. A three-part name counts as Azure only when its organization is your az default or one seen in an Azure remote.
 
+## Upgrading from 1.x
+
+2.0 moved the item list out to its own plugin, brain, and the test queue into `tests.db`. Drain or cancel queued and running jobs with 1.x before you update. If you updated with jobs still queued, every `test-phase queue` command refuses to run and says so. Run `test-phase queue import --cancel-live` once: it copies the old jobs and runs into `tests.db`, marks the queued and running ones cancelled (reason "queued under 1.x, not run") and never writes `brain.db`. Plain `test-phase queue import` does the same copy and is refused while jobs are live.
+
+Install the brain plugin if you want items (`brain list`, `brain close`, the session hooks); the queue and `test-phase` work without it. Then restart Claude Code.
+
+The MCP tools moved. `mcp__plugin_lean-agent-tools_brain__*` is gone. Queue tools are now `mcp__plugin_lean-agent-tools_tests__*` (this plugin's `tests` server), and item tools are `mcp__plugin_brain_brain__*` (the brain plugin's `brain` server). Permission allowlists that name the old tools need the new names.
+
 ## Settings
 
 Set these in the `env` block of your Claude Code settings. The defaults run the method as written.
@@ -180,6 +188,7 @@ Set these in the `env` block of your Claude Code settings. The defaults run the 
 | `LEAN_IMAGE_CONTEXT` | `60000` | Context size, in tokens, above which an image result is noted, or refused with `LEAN_IMAGE_MODE=block`. `off` turns both off. |
 | `LEAN_IMAGE_MODE` | `note` | `block` refuses tools that return an image (Read of an image file or a pdf with pages, screenshot and thumbnail tools) above `LEAN_IMAGE_CONTEXT`, so a subagent looks and reports in text. |
 | `LEAN_BRAIN_DB` | `~/.local/share/lean/brain.db` | Where the brain plugin keeps its database. `test-phase` files failures there when brain is installed. |
+| `LEAN_TESTS_DB` | `~/.local/share/lean/tests.db` | Where `test-phase` keeps the queue and the run history. The first open copies the jobs and runs from `LEAN_BRAIN_DB`. |
 | `LEAN_SKIP_SECRET_SCAN` | off | `1` turns off `secret-scan`, the Claude hook and the git hooks it installs, in every profile. A line with `allow-secret` on it is skipped without this. |
 | `LEAN_SCRIPT_NOTE` | on | `off` stops the note that names the script behind a hand-written command. |
 | `LEAN_DIRECT_TEST` | block in `strict`, nothing in `standard` | `on` stops the block on a direct `dotnet test`, `npm test`, `npx vitest` or `vitest run` where test-phase can take the job. Tests go through `test-phase queue add` and `test-phase`. A `package.json` that uses jest and not vitest is left alone, and so is a `pnpm -r`, `--filter`, `turbo` or `nx` script, since the queue has no jest runner. |

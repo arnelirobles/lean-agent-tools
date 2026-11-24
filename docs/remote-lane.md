@@ -83,7 +83,7 @@ There is no Jest runner. A job whose `package.json` uses jest and not vitest fai
 
 A job whose test path is a `playwright.config.ts` (or `.js`, `.mjs`, `.cjs`) runs Playwright from that folder: the same install, then `playwright test --reporter=list`. The fast filter pieces are file filters, and a failed test is named `file > title`, so a rerun is per spec file. The default `node_image` has no Playwright browsers, so on a host set `node_image` to an image that has them (for example `mcr.microsoft.com/playwright`) or run the job on the local lane.
 
-A job whose test path is a `settings.gradle.kts` or `settings.gradle` (or the folder holding one) is a Gradle job. It never runs on a remote lane: a Gradle build can read `~/.gradle/gradle.properties`, `~/.gradle/init.d`, `~/.m2/settings.xml` and signing keys, and the local lane is the only place that has been checked for that. The job is marked `platform=private`, so only the local lane takes it. `test-phase queue route ID --to remote` and `--to any` refuse it, with or without `--force`, `test-phase queue add --platform none` is refused, and a remote lane that still receives one hands it back (brain pins it local again). `run_script` refuses `kind=gradle`. `lean_remote` does not add Gradle files to its never-copy list, because a Gradle job never reaches the copy.
+A job whose test path is a `settings.gradle.kts` or `settings.gradle` (or the folder holding one) is a Gradle job. It never runs on a remote lane: a Gradle build can read `~/.gradle/gradle.properties`, `~/.gradle/init.d`, `~/.m2/settings.xml` and signing keys, and the local lane is the only place that has been checked for that. The job is marked `platform=private`, so only the local lane takes it. `test-phase queue route ID --to remote` and `--to any` refuse it, with or without `--force`, `test-phase queue add --platform none` is refused, and a remote lane that still receives one hands it back (test-phase pins it local again in tests.db). `run_script` refuses `kind=gradle`. `lean_remote` does not add Gradle files to its never-copy list, because a Gradle job never reaches the copy.
 
 Three things to know:
 
@@ -109,7 +109,7 @@ Each claim prunes: the newest `build_keep` folders of the repository stay (newes
 
 A job whose test project targets `-maccatalyst`, `-ios` or `-macos` is marked `platform=apple` and runs on the local lane only. An npm job (a `package.json` or Playwright config) whose `.npmrc`, in its folder or any folder up to the repo root, names a registry other than registry.npmjs.org is marked `platform=private` and also runs on the local lane only: its login lives in `~/.npmrc` on this machine, and the copy to a remote host never sends secrets. A Gradle job is `platform=private` too (see above), and `platform=apple` when its `--args` name an iOS test task (a test task whose name contains `ios`, in any case; option values do not count). Everything else can run on any lane. `test-phase queue add --platform apple|auto|none` overrides the detection.
 
-To choose for a job already queued, use `test-phase queue route ID --to remote|local|any`. `remote` sends it to a remote lane only, so the local lane skips it even when idle. `local` pins it to this machine. `any` lets whichever lane is free take it. Jobs queued before the upgrade to schema 7 are all marked `platform=apple`, so route the ones you want on a remote host. Routing a job to `remote` whose project looks Apple-only prints a warning and still routes it. A job routed to `remote` with no remote lane up stays queued, and test-phase names it at the end of the drain.
+To choose for a job already queued, use `test-phase queue route ID --to remote|local|any`. `remote` sends it to a remote lane only, so the local lane skips it even when idle. `local` pins it to this machine. `any` lets whichever lane is free take it. Jobs copied from a brain.db older than schema 7 have no platform set, so any lane may take them; pin one that needs this machine with `test-phase queue route ID --to local`. Routing a job to `remote` whose project looks Apple-only prints a warning and still routes it. A job routed to `remote` with no remote lane up stays queued, and test-phase names it at the end of the drain.
 
 ## Lane problems
 
@@ -121,7 +121,7 @@ Every container and network carries the label `lean.job=<id>`. A job removes its
 
 ## One drainer per host
 
-Run one `test-phase` per host list. The sweep assumes every running job it sees in brain is its own. Two drainers sharing a host would remove each other's work.
+Run one `test-phase` per host list. The sweep assumes every running job it sees in tests.db is its own. Two drainers sharing a host would remove each other's work.
 
 ## Reading the output
 
@@ -129,4 +129,4 @@ Run one `test-phase` per host list. The sweep assumes every running job it sees 
 
 ## Rollout
 
-The first new `test-phase` moves the database to schema 7 (`jobs.platform`, `jobs.host`, `runs.host`). Older copies then refuse the database. Stop the drainer, then replace every copy of `test-phase` in one step, then start the drainer.
+`tests.db` has its own schema, currently 1, and a test-phase that finds a newer one stops with a message. When you update, stop the drainer, replace every copy of `test-phase` in one step, then start the drainer.

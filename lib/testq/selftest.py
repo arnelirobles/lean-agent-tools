@@ -396,7 +396,8 @@ def refused_checks(fails, d):
     os.environ["LEAN_BRAIN_DB"] = brain
     os.environ["LEAN_TESTS_DB"] = os.path.join(d, "refuse.db")
     want = ("test-phase: brain.db still has 2 queued or running jobs. "
-            "Drain them with lean-agent-tools 1.x, then run this again.")
+            "Drain them with lean-agent-tools 1.x, or run `test-phase queue import --cancel-live` "
+            "to copy them as cancelled.")
     with isolated(d, "refuse"):
         for argv in (("queue", "list"), ("stats",), ("run-add", "--project", "p", "--test-project", "t",
                                                     "--tier", "full")):
@@ -688,7 +689,10 @@ def self_test():
 
         for checks in (queue_checks, session_checks, flaky_checks, stats_checks, refused_checks, upgrade_checks,
                        e2e_brain_checks):
-            checks(fails, d)
+            try:
+                checks(fails, d)
+            except Exception as e:  # noqa: BLE001  one crashed group must not hide the others
+                fails.append(f"{checks.__name__} crashed: {e!r}")
     os.environ.clear()
     os.environ.update(saved_env)
     if fails:

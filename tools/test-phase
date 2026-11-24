@@ -1263,11 +1263,17 @@ def testq_run(argv):
     return rc or 0, out.getvalue(), err.getvalue()
 
 
+def unprefix(text):
+    """text stripped, without one leading "test-phase: " (testq messages carry it already)."""
+    text = text.strip()
+    return text[len("test-phase: "):] if text.startswith("test-phase: ") else text
+
+
 def testq_cli(argv):
     """stdout of a testq command, stripped; None on a non-zero code, with its stderr passed on."""
     rc, out, err = testq_run(argv)
     if rc != 0:
-        sys.stderr.write("test-phase: " + (err.strip() or f"{' '.join(argv[:2])} exit {rc}") + "\n")
+        sys.stderr.write("test-phase: " + (unprefix(err) or f"{' '.join(argv[:2])} exit {rc}") + "\n")
         return None
     return out.strip()
 
@@ -1971,7 +1977,7 @@ def enqueue(entries, a, cycle):
                     queue_cli(["cancel", fast_id])
                     queued.remove(fast_id)
                 kept = f"jobs from earlier plan lines stay queued: {', '.join('#' + i for i in queued)}. " if queued else ""
-                sys.exit(f"test-phase: could not queue {project} ({tier_args[1]}): {r_err.strip()}\n"
+                sys.exit(f"test-phase: could not queue {project} ({tier_args[1]}): {unprefix(r_err)}\n"
                          f"test-phase: the rest of the plan was not queued; {kept}Fix that, or add again=REASON to the plan line to run it anyway.")
 
 
@@ -2195,7 +2201,13 @@ def main(argv):
     if argv[:1] and argv[0] in ("queue", "run-add", "flaky-clear", "stats"):
         from testq import cli
         return cli.main(argv)
-    p = argparse.ArgumentParser(prog="test-phase", description="Drain the test queue.")
+    p = argparse.ArgumentParser(
+        prog="test-phase", description="Drain the test queue.", formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="subcommands (run `test-phase <name> --help`):\n"
+               "  queue       add, list, wait, cancel, bump, move, route and import jobs\n"
+               "  run-add     record a finished run in tests.db\n"
+               "  flaky-clear close flaky items after clean runs\n"
+               "  stats       suite numbers: runs, lane wait, duration, flaky rate")
     p.add_argument("plan", nargs="?")
     p.add_argument("--lane", default="dotnet")
     p.add_argument("--stall", type=int, default=int(os.environ.get("TEST_PHASE_STALL", "600")),
@@ -2220,6 +2232,10 @@ def main(argv):
             print(f"test-phase: {target} is not a directory", file=sys.stderr)
             return 2
         return tn.doctor(os.path.abspath(target))
+    rc, _, err = testq_run(["queue", "list", "--status", "queued"])
+    if rc == 2:  # the copy from brain.db is refused, or tests.db is from a newer test-phase
+        sys.stderr.write(err.strip() + "\n")
+        return 2
     stamp = time.strftime("%Y%m%d-%H%M%S")
     cycle = a.cycle or stamp
     if a.plan:
@@ -2267,7 +2283,8 @@ def main(argv):
     print()
     print(table(rows, len(lanes) > 1))
     print(f"\ntest-phase: {len(rows)} jobs, {sum(r['real'] for r in rows)} real, "
-          f"{sum(r['flaky'] for r in rows)} flaky, {cancelled} cancelled. `brain list --open` has the entries.")
+          f"{sum(r['flaky'] for r in rows)} flaky, {cancelled} cancelled. "
+          + ("`brain list --open` has the entries." if brainlink.find_brain() else f"The job logs are in {run_dir}."))
     say_waiting_remote()
     return 1 if cancelled or any(is_bad(r) for r in rows) else 0
 

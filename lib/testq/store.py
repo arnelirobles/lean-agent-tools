@@ -34,6 +34,18 @@ class CopyRefused(Exception):
         self.count = count
 
 
+class NewerSchema(Exception):
+    """Raised when tests.db was written by a later test-phase."""
+
+    def __init__(self, path, found):
+        super().__init__(f"{path} has schema {found}, this test-phase knows {SCHEMA_VERSION}")
+        self.path = path
+        self.found = found
+
+
+CANCEL_REASON = "queued under 1.x, not run"
+
+
 def db_path():
     return os.environ.get("LEAN_TESTS_DB") or os.path.expanduser("~/.local/share/lean/tests.db")
 
@@ -54,9 +66,24 @@ def _has_table(con, table):
     return con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
 
 
-def copy_from_brain(con, src):
+def copy_done(path=None):
+    """True when the tests.db at path (default: the configured one) already holds the copy marker."""
+    path = path or db_path()
+    if not os.path.exists(path):
+        return False
+    con = sqlite3.connect(path)
+    try:
+        return con.execute("SELECT 1 FROM meta WHERE key=?", (MARKER,)).fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        con.close()
+
+
+def copy_from_brain(con, src, cancel_live=False):
     """Copy jobs and runs from the brain.db at src into con, once. con must be in autocommit mode.
-    Returns the number of rows copied. Raises CopyRefused, with nothing written, while src has live jobs."""
+    Returns the number of rows copied. Raises CopyRefused, with nothing written, while src has live jobs,
+    unless cancel_live: then each live job lands in con as cancelled. src is never written."""
     con.execute("BEGIN IMMEDIATE")
     source = None
     try:
@@ -66,9 +93,10 @@ def copy_from_brain(con, src):
         copied = 0
         if os.path.exists(src):
             uri = "file:" + quote(os.path.abspath(src)) + "?mode=ro"
-            source = sqlite3.connect(uri, uri=True)
+            source = sqlite3.connect(uri, uri=True, isolation_level=None)
             source.row_factory = sqlite3.Row
-            if _has_table(source, "jobs"):
+            source.execute("BEGIN")  # one snapshot for the live count and the row reads
+            if _has_table(source, "jobs") and not cancel_live:
                 live = source.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running')").fetchone()[0]
                 if live:
                     raise CopyRefused(live)
@@ -79,7 +107,13 @@ def copy_from_brain(con, src):
                 cols = ", ".join(shared)
                 marks = ", ".join("?" for _ in shared)
                 for row in source.execute(f"SELECT {cols} FROM {table} ORDER BY id"):
-                    con.execute(f"INSERT INTO {table} ({cols}) VALUES ({marks})", tuple(row))
+                    values = list(row)
+                    if cancel_live and table == "jobs" and row["status"] in ("queued", "running"):
+                        values[shared.index("status")] = "cancelled"
+                        values[shared.index("reason")] = CANCEL_REASON
+                        if "ended_at" in shared:
+                            values[shared.index("ended_at")] = now()
+                    con.execute(f"INSERT INTO {table} ({cols}) VALUES ({marks})", values)
                     copied += 1
         con.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (MARKER, now()))
         con.execute("COMMIT")
@@ -93,7 +127,7 @@ def copy_from_brain(con, src):
             source.close()
 
 
-def connect(timeout=30):
+def connect(timeout=30, cancel_live=False):
     path = db_path()
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     con = sqlite3.connect(path, timeout=timeout, isolation_level=None)
@@ -105,7 +139,15 @@ def connect(timeout=30):
             except sqlite3.OperationalError:  # no meta table yet
                 return None
 
-        if not meta("schema_version"):  # a plain read first, so a set up database takes no write lock
+        found = meta("schema_version")
+        if found:
+            try:
+                newer = int(found[0]) > SCHEMA_VERSION
+            except ValueError:
+                newer = False
+            if newer:
+                raise NewerSchema(path, found[0])
+        if not found:  # a plain read first, so a set up database takes no write lock
             con.execute("BEGIN IMMEDIATE")
             con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             con.execute(RUNS_DDL)
@@ -115,7 +157,7 @@ def connect(timeout=30):
                         (str(SCHEMA_VERSION),))
             con.execute("COMMIT")
         if not meta(MARKER):
-            copy_from_brain(con, brain_db_path())
+            copy_from_brain(con, brain_db_path(), cancel_live)
     except BaseException:
         if con.in_transaction:
             con.execute("ROLLBACK")

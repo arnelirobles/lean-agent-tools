@@ -27,6 +27,15 @@ import time
 HERE = os.path.dirname(os.path.realpath(__file__))
 TEST_PHASE = os.path.join(HERE, "test-phase")
 DEFAULT_PROTOCOL = "2025-06-18"
+CALL_TIMEOUT = 60
+
+
+def plugin_version():
+    try:
+        with open(os.path.join(HERE, "..", ".claude-plugin", "plugin.json")) as f:
+            return str(json.load(f)["version"])
+    except (OSError, ValueError, KeyError):
+        return "0"
 
 
 def log(*a):
@@ -202,7 +211,8 @@ def run_test_phase(args, stdin):
     if path:
         with open(path, "a") as f:
             f.write(json.dumps(argv) + "\n")
-    r = subprocess.run(argv, input=stdin, capture_output=True, text=True)
+    extra = {"stdin": subprocess.DEVNULL} if stdin is None else {"input": stdin}
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=CALL_TIMEOUT, **extra)
     return r.returncode, r.stdout, r.stderr
 
 
@@ -222,6 +232,8 @@ def call_tool(name, a):
         return result(str(e), True)
     try:
         rc, out, err = run_test_phase(args, stdin)
+    except subprocess.TimeoutExpired:
+        return result(f"test-phase timed out after {CALL_TIMEOUT} seconds", True)
     except OSError as e:
         return result(f"could not run test-phase: {e}", True)
     if rc != 0:
@@ -250,7 +262,7 @@ def handle(msg):
         return None
     if method == "initialize":
         return ok({"protocolVersion": params.get("protocolVersion") or DEFAULT_PROTOCOL,
-                   "capabilities": {"tools": {}}, "serverInfo": {"name": "tests", "version": "1.0.0"}})
+                   "capabilities": {"tools": {}}, "serverInfo": {"name": "tests", "version": plugin_version()}})
     if method == "ping":
         return ok({})
     if method == "tools/list":
